@@ -17,9 +17,6 @@ public class DbUpdator extends DbOperator {
     }
 
     public int update() throws SQLException {
-        Statement s = _conn.createStatement();
-        s.executeUpdate(_sql);
-
         final String sql = _sql;
         PreparedStatement stmt = _create(_conn, sql);
         try {
