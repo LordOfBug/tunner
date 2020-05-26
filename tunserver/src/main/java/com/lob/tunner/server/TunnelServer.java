@@ -4,6 +4,8 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import com.lob.tunner.common.Config;
 import com.lob.tunner.logger.AutoLog;
+import com.lob.tunner.server.db.AccountDao;
+import com.lob.tunner.server.db.DaoUtils;
 import com.lob.tunner.server.echo.EchoServer;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.ChannelFuture;
@@ -32,6 +34,9 @@ public class TunnelServer {
 
         Config.initialize(args, false);
 
+        java.sql.Connection conn = DaoUtils.getConnection();
+        AccountDao.get(conn, "foo", 0);
+        
         try {
             if(Config.isTestMode()) {
                 // for testing purpose

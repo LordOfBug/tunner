@@ -20,7 +20,7 @@ public class AccountDao {
     private final static String SQL_DELETE = "DELETE FROM %s.accounts WHERE id=?";
     private final static String SQL_UPDATE = "UPDATE %s.accounts set properties=? WHERE id=?";
     private final static String SQL_GET_BY_NAME = "SELECT id, name, properties FROM %s.accounts WHERE name=?";
-    private final static String SQL_GET_BY_ID = "SELECT id, name, properties FROM %s.accounts WHERE id=?";
+    private final static String SQL_GET_BY_ID = "SELECT id, name, properties FROM %s.accounts WHERE id=%d";
 
     /*
      * createTable must have dbName parameter although we didn't use it
@@ -101,9 +101,9 @@ public class AccountDao {
 
 
     public static Account get(Connection conn, String dbName, long id) throws SQLException {
-        String sql = "fofaf fdafaf";
+        String sql = String.format(SQL_GET_BY_ID, dbName, id);
         // return DaoUtils.get(conn, _getSQL(SQL_GET_BY_ID, dbName), _LOADER::load, id);
-        return DaoUtils.get(conn, sql, _LOADER::load, id);
+        return DaoUtils.get(conn, sql, _LOADER::load);
     }
 
 
