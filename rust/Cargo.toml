@@ -1,0 +1,25 @@
+[package]
+name = "tunner"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+clap = { version = "4.5", features = ["derive"] }
+bytes = "1.6"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+
+[[bin]]
+name = "tunclient"
+path = "src/bin/tunclient.rs"
+
+[[bin]]
+name = "tunserver"
+path = "src/bin/tunserver.rs"
+
+[lib]
+name = "tunner"
+path = "src/lib.rs"
