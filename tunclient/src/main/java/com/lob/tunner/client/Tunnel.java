@@ -4,81 +4,53 @@ import com.lob.tunner.BlockUtils;
 import com.lob.tunner.common.Block;
 import com.lob.tunner.common.Config;
 import com.lob.tunner.logger.AutoLog;
-import com.lob.tunner.logger.HexDump;
-import net.schmizz.sshj.SSHClient;
-import net.schmizz.sshj.common.IOUtils;
-import net.schmizz.sshj.common.SSHPacket;
-import net.schmizz.sshj.connection.channel.direct.AbstractDirectChannel;
-import net.schmizz.sshj.connection.channel.direct.LocalPortForwarder;
-import net.schmizz.sshj.transport.verification.PromiscuousVerifier;
-import net.schmizz.sshj.userauth.UserAuthException;
-import net.schmizz.sshj.userauth.keyprovider.OpenSSHKeyFile;
-import net.schmizz.sshj.userauth.password.PasswordFinder;
-import net.schmizz.sshj.userauth.password.Resource;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.*;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.util.ReferenceCountUtil;
 
-import java.io.File;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
-import java.nio.channels.ReadableByteChannel;
-import java.nio.channels.WritableByteChannel;
-import java.util.LinkedList;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Represtents one forwarded connection to remote tunnel server.
- *
- * Remote tunnel server will by default listen on 818 port
+ * Represents one multiplexed TCP tunnel to the remote tunnel server.
  */
 public class Tunnel {
     private static final AtomicInteger _COUNTER = new AtomicInteger();
 
-    private static final int _DEFAULT_PORT = 22;
-    private static final int _FORWARD_PORT = 8080;
-
-    private final ByteBuffer _padding = ByteBuffer.allocate(8);
-    private final ByteBuffer _header = ByteBuffer.allocate(8);
-    private final ByteBuffer _headerOut = ByteBuffer.allocate(8);
+    private final int _id;
+    private volatile SocketChannel _channel;
     private final ConcurrentHashMap<Integer, Connection> _connections = new ConcurrentHashMap<>();
 
+    // Framing state machine for incoming stream
+    private static final int _RS_HEADER = 1;
+    private static final int _RS_PAYLOAD = 2;
+    private static final int _RS_PADDING = 3;
+    private int _readState = _RS_HEADER;
 
-    private final LinkedList<Block> _blocks = new LinkedList<>();
-    private final Lock _lock = new ReentrantLock();
-    private final Condition _empty = _lock.newCondition();
+    private final ByteBuffer _header = ByteBuffer.allocate(8);
+    private ByteBuffer _data = ByteBuffer.allocate(1024);
+    private final ByteBuffer _padding = ByteBuffer.allocate(8);
 
-    private volatile boolean _stop = false;
-    private final SSHClient _client;
-    private final Thread _reader;
-    private final Thread _writer;
+    // Rate tracking & Noise generator
+    private final AtomicLong _realBytesSentInTick = new AtomicLong(0);
+    private ScheduledExecutorService _noiseScheduler;
+    private static NoiseSource _noiseSource;
 
-    private String _target = "localhost";
-    private int _port = _DEFAULT_PORT;
-    private int _forwardPort = _FORWARD_PORT;
-    private AbstractDirectChannel _channel = null;
-
-    private final int _id;
-
-    /**
-     * Create a new tunnel
-     */
     public Tunnel() {
         _id = _COUNTER.incrementAndGet();
-        _client = new SSHClient();
-        _reader = new Thread(this::_readerMain);
-        _writer = new Thread(this::_writerMain);
     }
 
     public int getID() {
         return _id;
     }
 
-    public void multiplex(Connection conn) throws IOException {
+    public void multiplex(Connection conn) {
         _connections.put(conn.getID(), conn);
     }
 
@@ -87,347 +59,280 @@ public class Tunnel {
     }
 
     public boolean overloaded() {
-        // too many connections on this!!
         return _connections.size() > 10;
     }
 
-    public void start(String target, int forwardPort) throws IOException {
-        start(target, _DEFAULT_PORT, forwardPort);
-    }
-
-    /**
-     * Start the tunnel
-     * @param target
-     * @param port
-     * @param forwardPort
-     * @throws IOException
-     */
     public void start(String target, int port, int forwardPort) throws IOException {
-        _target = target;
-        _port = port;
-        _forwardPort = forwardPort;
-
-        AutoLog.INFO.log("Try starting new tunnel to %s:%d and forwarding to %d ", target, port, forwardPort);
-        _writer.start();
+        start(target, port);
     }
 
-    public void write(Block block) {
-        _lock.lock();
-        try {
-            if(_blocks.isEmpty()) {
-                _empty.signal();
-            }
+    public void start(String target, int port) throws IOException {
+        AutoLog.INFO.log("Starting new Netty TCP tunnel to %s:%d ...", target, port);
 
-            _blocks.add(block);
-        }
-        finally {
-            _lock.unlock();
-        }
-    }
-
-    private void _connect() throws IOException {
-        _client.addHostKeyVerifier(new PromiscuousVerifier());
-
-        _client.loadKnownHosts();
-        _client.connect(_target, _port);
-
-        String user = Config.getServerUser();
-        if(user == null || user.isEmpty()) {
-            user = System.getProperty("user.name");
-        }
-
-        try {
-            AutoLog.DEBUG.log("Try authenticate using system user - " + user);
-
-            String key = Config.getServerKey();
-            if(key != null && !key.isEmpty()) {
-                OpenSSHKeyFile keyFile;
-                keyFile = new OpenSSHKeyFile();
-                keyFile.init(new File(key), new PasswordFinder() {
+        Bootstrap bootstrap = new Bootstrap();
+        bootstrap.group(TunnelClient.REMOTEWORKER)
+                .channel(NioSocketChannel.class)
+                .option(ChannelOption.TCP_NODELAY, true)
+                .option(ChannelOption.SO_KEEPALIVE, true)
+                .handler(new ChannelInitializer<SocketChannel>() {
                     @Override
-                    public char[] reqPassword(Resource<?> resource) {
-                        // final String pass = Config.getServerPass();
-                        final String pass = TunnelClient.password;
-                        return pass.toCharArray();
-                    }
-
-                    @Override
-                    public boolean shouldRetry(Resource<?> resource) {
-                        return false;
+                    protected void initChannel(SocketChannel ch) {
+                        ch.pipeline().addLast(new TunnelInboundHandler());
                     }
                 });
 
-                AutoLog.INFO.log("Try auth with pub key %s and pass %s ...", key, TunnelClient.password);
-                _client.authPublickey(user, keyFile);
-            }
-            else {
-                _client.authPassword(user, Config.getServerPass());
-            }
-
-            AutoLog.INFO.log("Tunnel established ...");
-        }
-        catch(UserAuthException uae) {
-            AutoLog.ERROR.exception(uae).log("Cannot authenticate using default user - " + user);
-            throw new IOException("Invalid username / password!");
-        }
-
-        /**
-         * todo: we always try to forward to a port on remote "local" host
-         */
-        final String remoteHost = "127.0.0.1";
-        final LocalPortForwarder.Parameters params = new LocalPortForwarder.Parameters(
-                Config.getListenAddress(), Config.getListenPort(), remoteHost, _forwardPort
-        );
-
-        /**
-         * Create a direct channel
-         */
-        _channel = new DirectTCPIPChannel(_client.getConnection(), params);
-        _channel.open();
-    }
-
-    private Block _readBlock(ReadableByteChannel channel) throws IOException {
-        while (_header.hasRemaining()) {
-            channel.read(_header);
-        }
-
-        _header.rewind();
-        short typeSeq = _header.getShort();
-        int len = (_header.getShort() & 0x0FFFF);
-        int conn = _header.getInt();
-
-        // boolean trace = (len == Block.MAX_NO_PADDING_LENGTH);
-        boolean trace = false;
-
-        if(trace) {
-            AutoLog.INFO.log("Read header - %s", HexDump.dumpHexString(_header.array()));
-        }
-        else {
-            AutoLog.DEBUG.log("Read header - %s", HexDump.dumpHexString(_header.array()));
-        }
-
-        // prepare for next block!!!!
-        _header.clear();
-
-        if(typeSeq == 0 && len == 0 && conn == 0) {
-            // all 0 header!!! Ignore
-            return null;
-        }
-
-        if(len == 0) {
-            return new Block(conn, typeSeq);
-        }
-        else {
-            ByteBuffer buffer = ByteBuffer.allocate(len);
-            while (buffer.hasRemaining()) {
-                channel.read(buffer);
-            }
-
-            if(trace) {
-                AutoLog.INFO.log("Read data - %s", HexDump.dumpHexString(buffer.array()));
-            }
-            else {
-                AutoLog.DEBUG.log("Read data - %s", HexDump.dumpHexString(buffer.array()));
-            }
-
-            // If there are padding, let's get the padding
-            int padding = len % 8;
-            if (padding > 0) {
-                _padding.rewind();
-                _padding.limit(8 - padding);
-
-                while(_padding.hasRemaining()) {
-                    channel.read(_padding);
-                }
-
-                if(trace) {
-                    AutoLog.INFO.log("Read padding - %s", HexDump.dumpHexString(_padding.array(), 0, 8 - padding));
-                }
-                else {
-                    AutoLog.DEBUG.log("Read padding - %s", HexDump.dumpHexString(_padding.array(), 0, 8 - padding));
-                }
-            }
-
-            // ready for writing out ...
-            buffer.rewind();
-            return new Block(conn, typeSeq, len, buffer);
-        }
-    }
-
-    private void _readerMain() {
-        final ReadableByteChannel channel = Channels.newChannel(_channel.getInputStream());
-
-        // we are always 8 bytes!!!
         try {
-            while (!_stop) {
-                Block block = _readBlock(channel);
+            ChannelFuture future = bootstrap.connect(target, port).sync();
+            _channel = (SocketChannel) future.channel();
+            AutoLog.INFO.log("Tunnel %08x connected successfully to %s:%d", _id, target, port);
+        } catch (Exception e) {
+            AutoLog.ERROR.exception(e).log("Failed to connect tunnel to %s:%d", target, port);
+            throw new IOException("Cannot connect to remote tunnel server: " + e.getMessage(), e);
+        }
 
-                if (block == null) {
+        _startNoiseGenerator();
+    }
+
+    private void _startNoiseGenerator() {
+        long minRate = Config.getMinRate();
+        if (minRate <= 0) {
+            return;
+        }
+
+        synchronized (Tunnel.class) {
+            if (_noiseSource == null) {
+                _noiseSource = new NoiseSource(Config.getNoiseFile());
+            }
+        }
+
+        final int tickMs = (minRate < 1000) ? 500 : 100;
+        final long targetBytesPerTick = Math.max(1, (minRate * tickMs) / 1000);
+
+        AutoLog.INFO.log("Starting noise generator for tunnel %08x: minRate=%d bytes/s (~%d bytes per %d ms), echo=%s",
+                _id, minRate, targetBytesPerTick, tickMs, Config.isEcho());
+
+        _noiseScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "NoiseGenerator-" + _id);
+            t.setDaemon(true);
+            return t;
+        });
+
+        _noiseScheduler.scheduleAtFixedRate(() -> {
+            try {
+                if (_channel == null || !_channel.isActive()) {
+                    return;
+                }
+
+                long realSent = _realBytesSentInTick.getAndSet(0);
+                if (realSent < targetBytesPerTick) {
+                    long deficit = targetBytesPerTick - realSent;
+                    short ctrlCode = Config.isEcho() ? Block.CODE_ECHO : Block.CODE_NOISE;
+
+                    while (deficit > 0) {
+                        int chunkSize = (int) Math.min(deficit, Block.MAX_NO_PADDING_LENGTH);
+                        ByteBuffer noiseBuf = _noiseSource.getBytes(chunkSize);
+                        Block block = new Block(0, BlockUtils.control(ctrlCode), chunkSize, noiseBuf);
+                        _sendBlock(block, false);
+                        deficit -= chunkSize;
+                    }
+                }
+            } catch (Exception e) {
+                AutoLog.ERROR.exception(e).log("Error generating noise on tunnel %08x", _id);
+            }
+        }, tickMs, tickMs, TimeUnit.MILLISECONDS);
+    }
+
+    public void write(Block block) {
+        _sendBlock(block, true);
+    }
+
+    private void _sendBlock(Block block, boolean isRealTraffic) {
+        if (_channel == null || !_channel.isActive()) {
+            AutoLog.ERROR.log("Tunnel %08x channel is closed, cannot write block!", _id);
+            return;
+        }
+
+        int length = block.length();
+        if (block.type() == Block.BLOCK_DATA) {
+            TunnelManager.TotalWrite.addAndGet(length);
+            if (isRealTraffic) {
+                _realBytesSentInTick.addAndGet(length);
+            }
+            AutoLog.INFO.log(
+                    "Write out data block (seq=%d, length=%d) for connection %08x on tunnel %08x ...",
+                    block.sequence(), length, block.connection(), _id
+            );
+        } else {
+            if (isRealTraffic) {
+                TunnelManager.TotalWrite.addAndGet(length);
+            }
+        }
+
+        int padding = (length % 8 == 0) ? 0 : (8 - (length % 8));
+        ByteBuf buf = _channel.alloc().buffer(8 + length + padding);
+
+        // Header
+        buf.writeShort(block.getTypeSeq());
+        buf.writeShort((short) (length & 0xFFFF));
+        buf.writeInt(block.connection());
+
+        // Payload
+        if (length > 0 && block.data() != null) {
+            ByteBuffer data = block.data();
+            data.rewind();
+            buf.writeBytes(data);
+        }
+
+        // Padding
+        if (padding > 0) {
+            buf.writeBytes(BlockUtils.PADDING, 0, padding);
+        }
+
+        _channel.writeAndFlush(buf);
+    }
+
+    private boolean _readInto(ByteBuf src, ByteBuffer dst) {
+        while (dst.hasRemaining() && src.isReadable()) {
+            dst.put(src.readByte());
+        }
+        return dst.hasRemaining();
+    }
+
+    public synchronized void read(ByteBuf data) {
+        while (data.isReadable()) {
+            if (_readState == _RS_HEADER) {
+                if (_readInto(data, _header)) {
+                    return; // need more data
+                }
+
+                _header.rewind();
+                short typeSeq = _header.getShort();
+                int len = (_header.getShort() & 0xFFFF);
+                int conn = _header.getInt();
+
+                if (typeSeq == 0 && len == 0 && conn == 0) {
+                    _header.clear();
                     continue;
                 }
 
-                int id = block.connection();
-
-                if (block.type() == Block.BLOCK_DATA) {
-                    TunnelManager.TotalRead.addAndGet(block.length());
-
-                    AutoLog.INFO.log(
-                            "Read in data block (seq=%d, length=%d) for connection %08x on tunnel %08x ...",
-                            block.sequence(), block.length(), id, _id
-                    );
-
-                    Connection conn = _connections.get(id);
-                    if(conn == null) {
-                        AutoLog.WARN.log("Found non-existing connection %08x", id);
-
-                        write(new Block(id, BlockUtils.control(Block.CODE_ABORT)));
-
-                        return;
+                if (len > 0) {
+                    while (len > _data.capacity()) {
+                        _data = ByteBuffer.allocate(_data.capacity() << 1);
                     }
+                    _data.rewind();
+                    _data.limit(len);
+                    _readState = _RS_PAYLOAD;
+                } else {
+                    _handleBlock(conn, typeSeq, 0, null);
+                    _header.clear();
+                    _readState = _RS_HEADER;
+                }
+            } else if (_readState == _RS_PAYLOAD) {
+                if (_readInto(data, _data)) {
+                    return; // need more data
+                }
 
-                    conn.respond(block);
+                int len = _data.limit();
+                int padding = len % 8;
+                if (padding > 0) {
+                    _padding.rewind();
+                    _padding.limit(8 - padding);
+                    _readState = _RS_PADDING;
+                } else {
+                    _data.rewind();
+                    _handleBlock(_header.getInt(4), _header.getShort(0), len, _data);
+                    _header.clear();
+                    _readState = _RS_HEADER;
                 }
-                else {
-                    TunnelManager.getInstance().handleControl(this, id, block.control(), block.data());
+            } else if (_readState == _RS_PADDING) {
+                if (_readInto(data, _padding)) {
+                    return; // need more data
                 }
+
+                _data.rewind();
+                _handleBlock(_header.getInt(4), _header.getShort(0), _data.limit(), _data);
+                _header.clear();
+                _readState = _RS_HEADER;
             }
         }
-        catch(IOException ioe) {
-            AutoLog.ERROR.exception(ioe).log("Encounter exception while reading!");
-            // todo: how to abort
-        }
-        finally {
-            // ...
-        }
     }
 
-    private void _writeData(WritableByteChannel channel, ByteBuffer data) throws IOException {
-        data.rewind();
-
-        while(data.hasRemaining()) {
-            channel.write(data);
+    private void _handleBlock(int connId, short typeSeq, int len, ByteBuffer payload) {
+        Block block;
+        if (len == 0 || payload == null) {
+            block = new Block(connId, typeSeq);
+        } else {
+            ByteBuffer slice = ByteBuffer.allocate(len);
+            slice.put(payload);
+            slice.rewind();
+            block = new Block(connId, typeSeq, len, slice);
         }
-    }
 
-    private void _writeNoise(WritableByteChannel channel) throws IOException {
-        // ByteBuffer bb = ByteBuffer.allocate(1024);
-        // Block block = new Block(0, BlockUtils.control(Block.CODE_ECHO), (short)1024, bb);
-        Block block = new Block(0, BlockUtils.control(Block.CODE_ECHO));
-
-        // TODO: let's add random length of payload here ...
-        _writeBlock(channel, block);
-    }
-
-    private void _writeBlock(WritableByteChannel channel, Block block) throws IOException {
         if (block.type() == Block.BLOCK_DATA) {
-            TunnelManager.TotalWrite.addAndGet(block.length());
-
+            TunnelManager.TotalRead.addAndGet(block.length());
             AutoLog.INFO.log(
-                    "Write out data block (seq=%d, length=%d) for connection %08x on tunnel %08x ...",
-                    block.sequence(), block.length(), block.connection(), _id
+                    "Read in data block (seq=%d, length=%d) for connection %08x on tunnel %08x ...",
+                    block.sequence(), block.length(), connId, _id
             );
-        }
 
-        long start = System.currentTimeMillis();
-        int length = block.length();
-
-        int bytes = 8 + length;
-
-        // 1. respond header on channel
-        _headerOut.clear();
-        _headerOut.putShort(block.getTypeSeq());
-        _headerOut.putShort((short)(length & 0xFFFF));
-        _headerOut.putInt(block.connection());
-
-        _writeData(channel, _headerOut);
-
-        // 2. if payload, respond payload
-        if(length > 0) {
-            AutoLog.DEBUG.log("Written header - %s", HexDump.dumpHexString(_headerOut.array()));
-            _writeData(channel, block.data());
-
-            AutoLog.DEBUG.log("Written payload - %s", HexDump.dumpHexString(block.data().array()));
-
-            // 3. if payload and payload size not multiple of 8, respond padding bytes
-            length %= 8;
-            if(length > 0) {
-                int padding = (8 - length);
-                bytes += padding;
-
-                _writeData(channel, ByteBuffer.wrap(BlockUtils.PADDING, 0, padding));
-                AutoLog.DEBUG.log("Written padding - %s", HexDump.dumpHexString(BlockUtils.PADDING, 0, padding));
+            Connection conn = _connections.get(connId);
+            if (conn == null) {
+                AutoLog.WARN.log("Found non-existing connection %08x", connId);
+                write(new Block(connId, BlockUtils.control(Block.CODE_ABORT)));
+                return;
             }
-        }
-
-        long end = System.currentTimeMillis();
-        if((end - start) > 0) {
-            AutoLog.INFO.log("!!!!!!!!%d bytes data written in %d milliseconds!!!!!!!!!", bytes, (end - start));
+            try {
+                conn.respond(block);
+            } catch (Exception e) {
+                AutoLog.ERROR.exception(e).log("Failed responding to connection %08x", connId);
+            }
+        } else {
+            TunnelManager.getInstance().handleControl(this, connId, block.control(), block.data());
         }
     }
 
-    private void _writerMain() {
-        try {
-            AutoLog.INFO.log("Try starting a new tunnel by connecting to SSH server ...");
-            _connect();
+    public void shutdown() {
+        if (_noiseScheduler != null) {
+            _noiseScheduler.shutdownNow();
+            _noiseScheduler = null;
+        }
 
-            AutoLog.INFO.log("Tunnel created, starting tunnel reader ...");
-            _reader.start();
+        for (Connection conn : _connections.values()) {
+            conn.shutdown();
+        }
+        _connections.clear();
 
-            OutputStream os = _channel.getOutputStream();
-            WritableByteChannel channel = Channels.newChannel(os);
-
-            while(!_stop) {
-                // if there are data, respond data, otherwise sleep and respond background data ...
-                _lock.lock();
-                try {
-                    if(_blocks.isEmpty()) {
-                        if(!_empty.await(500, TimeUnit.MILLISECONDS)) {
-                            // time out
-                            if(false) {
-                                // let's not flush for testing purpose ...
-                                _writeNoise(channel);
-                                os.flush();
-                            }
-                            continue;
-                        }
-                    }
-
-                    Block block = _blocks.remove();
-                    _writeBlock(channel, block);
-                    os.flush();
-                }
-                finally {
-                    _lock.unlock();
-                }
+        if (_channel != null) {
+            try {
+                _channel.close();
+            } catch (Exception ignored) {
             }
-
-            AutoLog.INFO.log("Tunnel stopped");
-        }
-        catch(InterruptedException ie) {
-            AutoLog.ERROR.exception(ie).log("Tunnel interrupted!");
-        }
-        catch(IOException ioe) {
-            AutoLog.ERROR.exception(ioe).log("Cannot connect to remote SSH server!");
-        }
-        finally {
-            if(_channel != null) {
-                IOUtils.closeQuietly(_channel);
-                _channel = null;
-            }
+            _channel = null;
         }
     }
 
-    private static class DirectTCPIPChannel extends AbstractDirectChannel {
-        final LocalPortForwarder.Parameters parameters;
-
-        DirectTCPIPChannel(net.schmizz.sshj.connection.Connection conn, LocalPortForwarder.Parameters parameters) {
-            super(conn, "direct-tcpip");
-            this.parameters = parameters;
+    class TunnelInboundHandler extends ChannelInboundHandlerAdapter {
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            ByteBuf buf = (ByteBuf) msg;
+            try {
+                read(buf);
+            } finally {
+                ReferenceCountUtil.release(msg);
+            }
         }
 
         @Override
-        protected SSHPacket buildOpenReq() {
-            return (SSHPacket)((SSHPacket)((SSHPacket)((SSHPacket)super.buildOpenReq().putString(this.parameters.getRemoteHost())).putUInt32((long)this.parameters.getRemotePort())).putString(this.parameters.getLocalHost())).putUInt32((long)this.parameters.getLocalPort());
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            AutoLog.ERROR.exception(cause).log("Tunnel %08x inbound exception", _id);
+            ctx.close();
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+            AutoLog.WARN.log("Tunnel %08x disconnected from server", _id);
+            shutdown();
+            super.channelInactive(ctx);
         }
     }
 }

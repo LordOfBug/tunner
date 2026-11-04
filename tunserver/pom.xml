@@ -21,6 +21,12 @@
             <artifactId>tuncommon</artifactId>
             <version>0.1</version>
         </dependency>
+        <dependency>
+            <groupId>com.lob</groupId>
+            <artifactId>tunclient</artifactId>
+            <version>0.1</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

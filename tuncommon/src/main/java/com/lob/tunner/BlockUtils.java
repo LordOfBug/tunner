@@ -1,7 +1,5 @@
 package com.lob.tunner;
 
-import sun.management.snmp.jvmmib.JVM_MANAGEMENT_MIB;
-
 public class BlockUtils {
     public static final short MAX_SEQ = 0x3FFF;
 

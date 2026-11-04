@@ -119,9 +119,23 @@ public class TunnelManager {
                     conn.shutdown();
                 }
                 break;
+            case Block.CODE_NOISE:
+                // Dummy/noise data from client: discard payload silently to save bandwidth
+                if (data != null) {
+                    TunnelManager.TotalRead.addAndGet(data.remaining());
+                    AutoLog.DEBUG.log("Discarded noise block of %d bytes on tunnel %08x", data.remaining(), tunnel.identifier());
+                }
+                break;
             case Block.CODE_ECHO:
-                // todo: random payload?
-                tunnel.write(new Block(0, BlockUtils.control(Block.CODE_ECHO)));
+                if (data != null && data.hasRemaining()) {
+                    TunnelManager.TotalRead.addAndGet(data.remaining());
+                    ByteBuffer echoData = ByteBuffer.allocate(data.remaining());
+                    echoData.put(data);
+                    echoData.rewind();
+                    tunnel.write(new Block(0, BlockUtils.control(Block.CODE_ECHO), echoData.remaining(), echoData));
+                } else {
+                    tunnel.write(new Block(0, BlockUtils.control(Block.CODE_ECHO)));
+                }
                 break;
             default:
                 break;

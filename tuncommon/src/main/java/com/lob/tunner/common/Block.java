@@ -14,9 +14,10 @@ public class Block {
     public final static short BLOCK_DATA = (short)0x4000;
     public final static short BLOCK_CONTROL = (short)0x8000;
 
-    public final static short CODE_ECHO = 0; // with random 8*x bytes payload
+    public final static short CODE_ECHO = 0; // with random 8*x bytes payload (echo back)
     public final static short CODE_START = 1; // start a connection
     public final static short CODE_RESUME = 2;
+    public final static short CODE_NOISE = 3; // noise/dummy data, discard without echo
     public final static short CODE_ABORT = (short)0x00FF;
 
     /**

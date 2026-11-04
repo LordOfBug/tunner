@@ -113,8 +113,9 @@ public class TunnelManager {
 
                 break;
             case Block.CODE_ECHO:
-                // todo: random payload?
-                tunnel.write(new Block(connId, BlockUtils.control(Block.CODE_ECHO)));
+            case Block.CODE_NOISE:
+                // Server echoed back noise or dummy packet; log and discard (do not re-echo)
+                AutoLog.DEBUG.log("Received dummy/echo packet from server (%d bytes)", data != null ? data.remaining() : 0);
                 break;
             case Block.CODE_RESUME:
                 // shall not happen, only used at client side to resume data ...
