@@ -38,6 +38,9 @@ struct Args {
 
     #[arg(short = 'e', long, default_value_t = false)]
     echo: bool,
+
+    #[arg(long = "half-close-timeout", default_value_t = 5)]
+    half_close_timeout: u64,
 }
 
 static CONN_COUNTER: AtomicU32 = AtomicU32::new(1);
@@ -58,8 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.server, args.remote_port
     );
     info!(
-        "Min rate floor: {} bytes/s, echo requested: {}",
-        min_rate, args.echo
+        "Min rate floor: {} bytes/s, echo requested: {}, half-close timeout: {}s",
+        min_rate, args.echo, args.half_close_timeout
     );
 
     // 1. Connect to remote tunserver
@@ -255,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let tunnel_tx_conn = tunnel_tx.clone();
         let conns_conn = Arc::clone(&conns);
+        let half_close_timeout = Duration::from_secs(args.half_close_timeout);
 
         tokio::spawn(async move {
             let (mut socket_read, mut socket_write) = socket.into_split();
@@ -275,7 +279,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut read_closed = false;
             let mut write_closed = false;
             let mut aborted_by_remote = false;
-            let half_close_timeout = Duration::from_secs(60);
 
             loop {
                 tokio::select! {

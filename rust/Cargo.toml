@@ -11,6 +11,12 @@ bytes = "1.6"
 log = "0.4"
 env_logger = "0.11"
 rand = "0.8"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa", "encryption", "rand_core"] }
+sha2 = "0.10"
 
 [[bin]]
 name = "tunclient"

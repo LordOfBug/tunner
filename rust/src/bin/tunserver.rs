@@ -30,6 +30,9 @@ struct Args {
 
     #[arg(short = 'm', long, default_value = "prod")]
     mode: String,
+
+    #[arg(long = "half-close-timeout", default_value_t = 5)]
+    half_close_timeout: u64,
 }
 
 #[tokio::main]
@@ -40,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting Tunner Server...");
     info!("Tunnel listening port: {}:{}", args.interface, args.listen);
     info!("Backend proxy target: {}:{}", args.server, args.forward_port);
-    info!("Operating mode: {}", args.mode);
+    info!("Operating mode: {}, half-close timeout: {}s", args.mode, args.half_close_timeout);
 
     // If test mode is enabled, run an in-process TCP Echo Server on the forward port
     if args.mode.eq_ignore_ascii_case("test") {
@@ -74,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let backend_host = args.server;
     let backend_port = args.forward_port;
+    let half_close_timeout = Duration::from_secs(args.half_close_timeout);
 
     loop {
         let (tunnel_socket, peer_addr) = match listener.accept().await {
@@ -89,12 +93,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let target_host = backend_host.clone();
         tokio::spawn(async move {
-            handle_tunnel(tunnel_socket, target_host, backend_port).await;
+            handle_tunnel(tunnel_socket, target_host, backend_port, half_close_timeout).await;
         });
     }
 }
 
-async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_port: u16) {
+async fn handle_tunnel(
+    tunnel_socket: TcpStream,
+    backend_host: String,
+    backend_port: u16,
+    half_close_timeout: Duration,
+) {
     let (mut tunnel_read, mut tunnel_write) = tunnel_socket.into_split();
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Block>(1024);
 
@@ -121,133 +130,139 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
                             info!("Starting new backend connection {:08x}...", conn_id);
                             let target = format!("{}:{}", backend_host, backend_port);
 
-                            let connect_res = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                TcpStream::connect(&target),
-                            )
-                            .await;
+                            // Register channel immediately so Data/EOF/ABORT arriving while
+                            // TcpStream::connect is in flight are queued rather than dropped.
+                            let (tx, mut rx) = mpsc::channel::<Block>(128);
+                            {
+                                let mut map = connections.lock().await;
+                                map.insert(conn_id, tx);
+                            }
 
-                            match connect_res {
-                                Ok(Ok(backend_stream)) => {
-                                    backend_stream.set_nodelay(true).ok();
-                                    info!(
-                                        "Connected backend for {:08x} to {}",
-                                        conn_id, target
-                                    );
+                            let conns_clone = Arc::clone(&connections);
+                            let tunnel_tx_clone = tunnel_tx.clone();
 
-                                    let (mut backend_read, mut backend_write) =
-                                        backend_stream.into_split();
-                                    let (tx, mut rx) = mpsc::channel::<Block>(128);
+                            tokio::spawn(async move {
+                                let connect_res = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    TcpStream::connect(&target),
+                                )
+                                .await;
 
-                                    {
-                                        let mut map = connections.lock().await;
-                                        map.insert(conn_id, tx);
+                                let backend_stream = match connect_res {
+                                    Ok(Ok(stream)) => {
+                                        stream.set_nodelay(true).ok();
+                                        info!(
+                                            "Connected backend for {:08x} to {}",
+                                            conn_id, target
+                                        );
+                                        stream
                                     }
+                                    Ok(Err(e)) => {
+                                        error!(
+                                            "Failed connecting backend for {:08x} to {}: {}",
+                                            conn_id, target, e
+                                        );
+                                        conns_clone.lock().await.remove(&conn_id);
+                                        let _ = tunnel_tx_clone
+                                            .send(Block::new_control(conn_id, CODE_ABORT))
+                                            .await;
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        error!(
+                                            "Timed out connecting backend for {:08x} to {}",
+                                            conn_id, target
+                                        );
+                                        conns_clone.lock().await.remove(&conn_id);
+                                        let _ = tunnel_tx_clone
+                                            .send(Block::new_control(conn_id, CODE_ABORT))
+                                            .await;
+                                        return;
+                                    }
+                                };
 
-                                    let conns_clone = Arc::clone(&connections);
-                                    let tunnel_tx_clone = tunnel_tx.clone();
+                                let (mut backend_read, mut backend_write) =
+                                    backend_stream.into_split();
 
-                                    tokio::spawn(async move {
-                                        let mut buf = vec![0u8; MAX_NO_PADDING_LENGTH];
-                                        let mut res_seq: u16 = 0;
-                                        let mut read_closed = false;
-                                        let mut write_closed = false;
-                                        let mut aborted_by_client = false;
-                                        let half_close_timeout = Duration::from_secs(60);
+                                let mut buf = vec![0u8; MAX_NO_PADDING_LENGTH];
+                                let mut res_seq: u16 = 0;
+                                let mut read_closed = false;
+                                let mut write_closed = false;
+                                let mut aborted_by_client = false;
 
-                                        loop {
-                                            tokio::select! {
-                                                read_res = backend_read.read(&mut buf), if !read_closed => {
-                                                    match read_res {
-                                                        Ok(0) => {
-                                                            // Backend EOF (half-close)
-                                                            read_closed = true;
-                                                            if tunnel_tx_clone.send(Block::new_control(conn_id, CODE_EOF)).await.is_err() {
-                                                                break;
-                                                            }
-                                                            if write_closed {
-                                                                break;
-                                                            }
-                                                        }
-                                                        Ok(n) => {
-                                                            let data = Bytes::copy_from_slice(&buf[..n]);
-                                                            let blk = Block::new_data(conn_id, res_seq, data);
-                                                            res_seq = next_sequence(res_seq);
-                                                            if tunnel_tx_clone.send(blk).await.is_err() {
-                                                                break;
-                                                            }
-                                                        }
-                                                        Err(_) => break,
+                                loop {
+                                    tokio::select! {
+                                        read_res = backend_read.read(&mut buf), if !read_closed => {
+                                            match read_res {
+                                                Ok(0) => {
+                                                    // Backend EOF (half-close)
+                                                    read_closed = true;
+                                                    if tunnel_tx_clone.send(Block::new_control(conn_id, CODE_EOF)).await.is_err() {
+                                                        break;
+                                                    }
+                                                    if write_closed {
+                                                        break;
                                                     }
                                                 }
-                                                maybe_blk = rx.recv(), if !write_closed => {
-                                                    match maybe_blk {
-                                                        Some(blk) if blk.is_data() => {
-                                                            if let Err(e) = backend_write.write_all(&blk.data).await {
-                                                                error!(
-                                                                    "Failed writing to backend {:08x}: {}",
-                                                                    conn_id, e
-                                                                );
-                                                                break;
-                                                            }
-                                                        }
-                                                        Some(blk) if blk.control_code() == CODE_EOF => {
-                                                            let _ = backend_write.shutdown().await;
-                                                            write_closed = true;
-                                                            if read_closed {
-                                                                break;
-                                                            }
-                                                        }
-                                                        Some(_) => {}
-                                                        None => {
-                                                            // Client sent CODE_ABORT or tunnel closed
-                                                            aborted_by_client = true;
-                                                            break;
-                                                        }
+                                                Ok(n) => {
+                                                    let data = Bytes::copy_from_slice(&buf[..n]);
+                                                    let blk = Block::new_data(conn_id, res_seq, data);
+                                                    res_seq = next_sequence(res_seq);
+                                                    if tunnel_tx_clone.send(blk).await.is_err() {
+                                                        break;
                                                     }
                                                 }
-                                                _ = tokio::time::sleep(half_close_timeout), if read_closed || write_closed => {
-                                                    warn!("Half-closed backend conn {:08x} timed out, closing.", conn_id);
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        maybe_blk = rx.recv(), if !write_closed => {
+                                            match maybe_blk {
+                                                Some(blk) if blk.is_data() => {
+                                                    if let Err(e) = backend_write.write_all(&blk.data).await {
+                                                        error!(
+                                                            "Failed writing to backend {:08x}: {}",
+                                                            conn_id, e
+                                                        );
+                                                        break;
+                                                    }
+                                                }
+                                                Some(blk) if blk.control_code() == CODE_EOF => {
+                                                    let _ = backend_write.shutdown().await;
+                                                    write_closed = true;
+                                                    if read_closed {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(_) => {}
+                                                None => {
+                                                    // Client sent CODE_ABORT or tunnel closed
+                                                    aborted_by_client = true;
                                                     break;
                                                 }
                                             }
                                         }
+                                        _ = tokio::time::sleep(half_close_timeout), if read_closed || write_closed => {
+                                            warn!("Half-closed backend conn {:08x} timed out, closing.", conn_id);
+                                            break;
+                                        }
+                                    }
+                                }
 
-                                        // Both backend_read and backend_write are dropped when this task returns,
-                                        // ensuring the backend OS file descriptor is closed immediately.
-                                        if !write_closed {
-                                            let _ = backend_write.shutdown().await;
-                                        }
-                                        {
-                                            let mut map = conns_clone.lock().await;
-                                            map.remove(&conn_id);
-                                        }
-                                        if !aborted_by_client && !(read_closed && write_closed) {
-                                            let _ = tunnel_tx_clone
-                                                .send(Block::new_control(conn_id, CODE_ABORT))
-                                                .await;
-                                        }
-                                    });
+                                // Both backend_read and backend_write are dropped when this task returns,
+                                // ensuring the backend OS file descriptor is closed immediately.
+                                if !write_closed {
+                                    let _ = backend_write.shutdown().await;
                                 }
-                                Ok(Err(e)) => {
-                                    error!(
-                                        "Failed connecting backend for {:08x} to {}: {}",
-                                        conn_id, target, e
-                                    );
-                                    let _ = tunnel_tx
+                                {
+                                    let mut map = conns_clone.lock().await;
+                                    map.remove(&conn_id);
+                                }
+                                if !aborted_by_client && !(read_closed && write_closed) {
+                                    let _ = tunnel_tx_clone
                                         .send(Block::new_control(conn_id, CODE_ABORT))
                                         .await;
                                 }
-                                Err(_) => {
-                                    error!(
-                                        "Timed out connecting backend for {:08x} to {}",
-                                        conn_id, target
-                                    );
-                                    let _ = tunnel_tx
-                                        .send(Block::new_control(conn_id, CODE_ABORT))
-                                        .await;
-                                }
-                            }
+                            });
                         }
                         CODE_EOF => {
                             let maybe_tx = {
