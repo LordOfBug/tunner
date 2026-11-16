@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::interval;
 use tunner::{
     codec::{read_block, write_block},
@@ -81,9 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Channel for multiplexing blocks onto the tunnel
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Block>(1024);
     let real_bytes_sent_in_tick = Arc::new(AtomicU64::new(0));
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     // 2. Spawn Tunnel Writer task
     let real_bytes_writer = Arc::clone(&real_bytes_sent_in_tick);
+    let shutdown_tx_writer = shutdown_tx.clone();
     tokio::spawn(async move {
         while let Some(block) = tunnel_rx.recv().await {
             if block.is_data() {
@@ -94,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
         }
+        let _ = shutdown_tx_writer.send(true);
         info!("Tunnel writer terminated.");
     });
 
@@ -103,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let noise_tx = tunnel_tx.clone();
         let noise_real_bytes = Arc::clone(&real_bytes_sent_in_tick);
         let echo = args.echo;
+        let mut noise_shutdown = shutdown_rx.clone();
 
         tokio::spawn(async move {
             let tick_ms = if min_rate < 1000 { 500 } else { 100 };
@@ -115,7 +119,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             loop {
-                timer.tick().await;
+                tokio::select! {
+                    _ = timer.tick() => {}
+                    _ = noise_shutdown.changed() => {
+                        if *noise_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
                 let real_sent = noise_real_bytes.swap(0, Ordering::Relaxed);
                 if real_sent < target_bytes {
                     let mut deficit = (target_bytes - real_sent) as usize;
@@ -124,10 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     while deficit > 0 {
                         let chunk_size = deficit.min(MAX_NO_PADDING_LENGTH);
                         let dummy_bytes = noise_source.get_bytes(chunk_size);
-                        let noise_block =
-                            Block::new_control_with_data(0, code, dummy_bytes);
+                        let noise_block = Block::new_control_with_data(0, code, dummy_bytes);
                         if noise_tx.send(noise_block).await.is_err() {
-                            break;
+                            return;
                         }
                         deficit -= chunk_size;
                     }
@@ -142,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Spawn Tunnel Reader task
     let conns_reader = Arc::clone(&conns);
     let tunnel_tx_reader = tunnel_tx.clone();
+    let shutdown_tx_reader = shutdown_tx.clone();
     tokio::spawn(async move {
         loop {
             match read_block(&mut tunnel_read).await {
@@ -193,6 +204,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        // Drop all active connection senders so their tasks close sockets immediately
+        conns_reader.lock().await.clear();
+        let _ = shutdown_tx_reader.send(true);
     });
 
     // 6. Listen for local app connections
@@ -201,7 +215,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Tunnel client listening on {}", local_addr);
 
     loop {
-        let (socket, peer_addr) = listener.accept().await?;
+        let (socket, peer_addr) = tokio::select! {
+            res = listener.accept() => {
+                match res {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    error!("Tunnel connection lost, shutting down client.");
+                    return Err("Tunnel connection closed".into());
+                }
+                continue;
+            }
+        };
+
         let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
         info!("Accepted connection {:08x} from {}", conn_id, peer_addr);
 
@@ -218,66 +251,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (mut socket_read, mut socket_write) = socket.into_split();
 
             // Notify server of new connection
-            let _ = tunnel_tx_conn
+            if tunnel_tx_conn
                 .send(Block::new_control(conn_id, CODE_START))
-                .await;
+                .await
+                .is_err()
+            {
+                conns_conn.lock().await.remove(&conn_id);
+                return;
+            }
 
-            // Spawn socket response writer task
-            let conn_writer = tokio::spawn(async move {
-                let mut expected_seq: u16 = 0;
-                while let Some(block) = resp_rx.recv().await {
-                    let seq = block.sequence();
-                    if seq != expected_seq {
-                        error!(
-                            "Out-of-order sequence on conn {:08x}: got {}, expected {}",
-                            conn_id, seq, expected_seq
-                        );
-                    }
-                    expected_seq = next_sequence(seq);
-
-                    if let Err(e) = socket_write.write_all(&block.data).await {
-                        error!("Failed writing to local socket {:08x}: {}", conn_id, e);
-                        break;
-                    }
-                }
-                let _ = socket_write.shutdown().await;
-            });
-
-            // Read from local socket and send into tunnel
             let mut buf = vec![0u8; MAX_NO_PADDING_LENGTH];
             let mut req_seq: u16 = 0;
+            let mut expected_seq: u16 = 0;
+            let mut aborted_by_remote = false;
+
             loop {
-                match socket_read.read(&mut buf).await {
-                    Ok(0) => {
-                        info!("Local socket {:08x} EOF, closing.", conn_id);
-                        break;
-                    }
-                    Ok(n) => {
-                        let data = Bytes::copy_from_slice(&buf[..n]);
-                        let block = Block::new_data(conn_id, req_seq, data);
-                        req_seq = next_sequence(req_seq);
-                        if tunnel_tx_conn.send(block).await.is_err() {
-                            break;
+                tokio::select! {
+                    read_res = socket_read.read(&mut buf) => {
+                        match read_res {
+                            Ok(0) => {
+                                info!("Local socket {:08x} EOF, closing.", conn_id);
+                                break;
+                            }
+                            Ok(n) => {
+                                let data = Bytes::copy_from_slice(&buf[..n]);
+                                let block = Block::new_data(conn_id, req_seq, data);
+                                req_seq = next_sequence(req_seq);
+                                if tunnel_tx_conn.send(block).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error reading from local socket {:08x}: {}", conn_id, e);
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        error!("Error reading from local socket {:08x}: {}", conn_id, e);
-                        break;
+                    maybe_block = resp_rx.recv() => {
+                        match maybe_block {
+                            Some(block) => {
+                                let seq = block.sequence();
+                                if seq != expected_seq {
+                                    error!(
+                                        "Out-of-order sequence on conn {:08x}: got {}, expected {}",
+                                        conn_id, seq, expected_seq
+                                    );
+                                }
+                                expected_seq = next_sequence(seq);
+
+                                if let Err(e) = socket_write.write_all(&block.data).await {
+                                    error!("Failed writing to local socket {:08x}: {}", conn_id, e);
+                                    break;
+                                }
+                            }
+                            None => {
+                                // Channel closed (server sent CODE_ABORT or tunnel closed)
+                                aborted_by_remote = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
 
-            // Cleanup
-            let _ = tunnel_tx_conn
-                .send(Block::new_control(conn_id, CODE_ABORT))
-                .await;
+            // Cleanup: both socket_read and socket_write are dropped when this task returns,
+            // ensuring the OS file descriptor is always closed immediately.
+            let _ = socket_write.shutdown().await;
             {
                 let mut map = conns_conn.lock().await;
                 map.remove(&conn_id);
             }
-            conn_writer.abort();
+            if !aborted_by_remote {
+                let _ = tunnel_tx_conn
+                    .send(Block::new_control(conn_id, CODE_ABORT))
+                    .await;
+            }
             info!("Connection {:08x} terminated.", conn_id);
         });
     }
 }
-

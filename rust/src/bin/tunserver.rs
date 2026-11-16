@@ -3,6 +3,7 @@ use clap::Parser;
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -49,13 +50,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             loop {
-                if let Ok((mut socket, peer)) = echo_listener.accept().await {
-                    info!("EchoServer accepted connection from {}", peer);
-                    tokio::spawn(async move {
-                        let (mut r, mut w) = socket.split();
-                        let _ = tokio::io::copy(&mut r, &mut w).await;
-                        info!("EchoServer client {} disconnected", peer);
-                    });
+                match echo_listener.accept().await {
+                    Ok((mut socket, peer)) => {
+                        info!("EchoServer accepted connection from {}", peer);
+                        tokio::spawn(async move {
+                            let (mut r, mut w) = socket.split();
+                            let _ = tokio::io::copy(&mut r, &mut w).await;
+                            info!("EchoServer client {} disconnected", peer);
+                        });
+                    }
+                    Err(e) => {
+                        error!("EchoServer accept error: {}", e);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
         });
@@ -69,8 +76,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend_port = args.forward_port;
 
     loop {
-        let (tunnel_socket, peer_addr) = listener.accept().await?;
-        tunnel_socket.set_nodelay(true)?;
+        let (tunnel_socket, peer_addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!("Failed to accept tunnel connection: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        tunnel_socket.set_nodelay(true).ok();
         info!("Accepted new tunnel connection from {}", peer_addr);
 
         let target_host = backend_host.clone();
@@ -85,7 +99,7 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Block>(1024);
 
     // Spawn Tunnel Writer task
-    tokio::spawn(async move {
+    let writer_handle = tokio::spawn(async move {
         while let Some(block) = tunnel_rx.recv().await {
             if let Err(e) = write_block(&mut tunnel_write, &block).await {
                 error!("Failed writing to tunnel: {}", e);
@@ -107,15 +121,21 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
                             info!("Starting new backend connection {:08x}...", conn_id);
                             let target = format!("{}:{}", backend_host, backend_port);
 
-                            match TcpStream::connect(&target).await {
-                                Ok(backend_stream) => {
+                            let connect_res = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                TcpStream::connect(&target),
+                            )
+                            .await;
+
+                            match connect_res {
+                                Ok(Ok(backend_stream)) => {
                                     backend_stream.set_nodelay(true).ok();
                                     info!(
                                         "Connected backend for {:08x} to {}",
                                         conn_id, target
                                     );
 
-                                    let (backend_read, mut backend_write) =
+                                    let (mut backend_read, mut backend_write) =
                                         backend_stream.into_split();
                                     let (tx, mut rx) = mpsc::channel::<Block>(128);
 
@@ -124,67 +144,78 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
                                         map.insert(conn_id, tx);
                                     }
 
-                                    // Task 1: write incoming tunnel data to backend
-                                    let conns_clone1 = Arc::clone(&connections);
-                                    let tunnel_tx_clone1 = tunnel_tx.clone();
-                                    tokio::spawn(async move {
-                                        while let Some(blk) = rx.recv().await {
-                                            if let Err(e) =
-                                                backend_write.write_all(&blk.data).await
-                                            {
-                                                error!(
-                                                    "Failed writing to backend {:08x}: {}",
-                                                    conn_id, e
-                                                );
-                                                break;
-                                            }
-                                        }
-                                        let _ = backend_write.shutdown().await;
-                                        let mut map = conns_clone1.lock().await;
-                                        map.remove(&conn_id);
-                                        let _ = tunnel_tx_clone1
-                                            .send(Block::new_control(conn_id, CODE_ABORT))
-                                            .await;
-                                    });
+                                    let conns_clone = Arc::clone(&connections);
+                                    let tunnel_tx_clone = tunnel_tx.clone();
 
-                                    // Task 2: read backend responses and send to tunnel
-                                    let tunnel_tx_clone2 = tunnel_tx.clone();
-                                    let conns_clone2 = Arc::clone(&connections);
                                     tokio::spawn(async move {
-                                        let mut r = backend_read;
                                         let mut buf = vec![0u8; MAX_NO_PADDING_LENGTH];
                                         let mut res_seq: u16 = 0;
+                                        let mut aborted_by_client = false;
 
                                         loop {
-                                            match r.read(&mut buf).await {
-                                                Ok(0) => break, // EOF
-                                                Ok(n) => {
-                                                    let data =
-                                                        Bytes::copy_from_slice(&buf[..n]);
-                                                    let blk = Block::new_data(
-                                                        conn_id, res_seq, data,
-                                                    );
-                                                    res_seq = next_sequence(res_seq);
-                                                    if tunnel_tx_clone2.send(blk).await.is_err()
-                                                    {
-                                                        break;
+                                            tokio::select! {
+                                                read_res = backend_read.read(&mut buf) => {
+                                                    match read_res {
+                                                        Ok(0) => break, // Backend EOF
+                                                        Ok(n) => {
+                                                            let data = Bytes::copy_from_slice(&buf[..n]);
+                                                            let blk = Block::new_data(conn_id, res_seq, data);
+                                                            res_seq = next_sequence(res_seq);
+                                                            if tunnel_tx_clone.send(blk).await.is_err() {
+                                                                break;
+                                                            }
+                                                        }
+                                                        Err(_) => break,
                                                     }
                                                 }
-                                                Err(_) => break,
+                                                maybe_blk = rx.recv() => {
+                                                    match maybe_blk {
+                                                        Some(blk) => {
+                                                            if let Err(e) = backend_write.write_all(&blk.data).await {
+                                                                error!(
+                                                                    "Failed writing to backend {:08x}: {}",
+                                                                    conn_id, e
+                                                                );
+                                                                break;
+                                                            }
+                                                        }
+                                                        None => {
+                                                            // Client sent CODE_ABORT or tunnel closed
+                                                            aborted_by_client = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
 
-                                        let mut map = conns_clone2.lock().await;
-                                        map.remove(&conn_id);
-                                        let _ = tunnel_tx_clone2
-                                            .send(Block::new_control(conn_id, CODE_ABORT))
-                                            .await;
+                                        // Both backend_read and backend_write are dropped when this task returns,
+                                        // ensuring the backend OS file descriptor is closed immediately.
+                                        let _ = backend_write.shutdown().await;
+                                        {
+                                            let mut map = conns_clone.lock().await;
+                                            map.remove(&conn_id);
+                                        }
+                                        if !aborted_by_client {
+                                            let _ = tunnel_tx_clone
+                                                .send(Block::new_control(conn_id, CODE_ABORT))
+                                                .await;
+                                        }
                                     });
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     error!(
                                         "Failed connecting backend for {:08x} to {}: {}",
                                         conn_id, target, e
+                                    );
+                                    let _ = tunnel_tx
+                                        .send(Block::new_control(conn_id, CODE_ABORT))
+                                        .await;
+                                }
+                                Err(_) => {
+                                    error!(
+                                        "Timed out connecting backend for {:08x} to {}",
+                                        conn_id, target
                                     );
                                     let _ = tunnel_tx
                                         .send(Block::new_control(conn_id, CODE_ABORT))
@@ -251,5 +282,8 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
             }
         }
     }
-}
 
+    // Drop all connection senders so all backend tasks immediately close their sockets
+    connections.lock().await.clear();
+    writer_handle.abort();
+}
