@@ -2,17 +2,21 @@ use bytes::Bytes;
 use clap::Parser;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::interval;
 use tunner::{
+    auth::{client_authenticate, discover_default_keys, load_private_key},
     codec::{read_block, write_block},
-    next_sequence, parse_rate, Block, BlockType, NoiseSource, CODE_ABORT, CODE_ECHO, CODE_EOF,
-    CODE_NOISE, CODE_START, MAX_NO_PADDING_LENGTH,
+    next_sequence, parse_rate,
+    tls::{build_client_connector, make_server_name},
+    Block, BlockType, NoiseSource, CODE_ABORT, CODE_ECHO, CODE_EOF, CODE_NOISE, CODE_START,
+    MAX_NO_PADDING_LENGTH,
 };
 
 #[derive(Parser, Debug)]
@@ -39,8 +43,23 @@ struct Args {
     #[arg(short = 'e', long, default_value_t = false)]
     echo: bool,
 
-    #[arg(long = "half-close-timeout", default_value_t = 5)]
-    half_close_timeout: u64,
+    #[arg(long, default_value_t = false, help = "Enable TLS 1.3 transport")]
+    tls: bool,
+
+    #[arg(short = 'k', long = "key", help = "Path(s) to SSH private key(s) for client auth (auto-discovers ~/.ssh/id_* if omitted)")]
+    key: Vec<String>,
+
+    #[arg(long = "passphrase", help = "Passphrase for encrypted SSH private key (or set TUNNER_KEY_PASSPHRASE)")]
+    passphrase: Option<String>,
+
+    #[arg(long = "tls-ca", help = "Path to CA/server PEM certificate to verify server")]
+    tls_ca: Option<String>,
+
+    #[arg(long = "tls-fingerprint", help = "Expected SHA-256 hex fingerprint of server TLS certificate")]
+    tls_fingerprint: Option<String>,
+
+    #[arg(long = "tls-insecure", default_value_t = false, help = "Skip TLS server certificate verification")]
+    tls_insecure: bool,
 }
 
 static CONN_COUNTER: AtomicU32 = AtomicU32::new(1);
@@ -54,23 +73,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let min_rate = parse_rate(&args.min_rate);
 
+    let use_tls = args.tls
+        || !args.key.is_empty()
+        || args.tls_ca.is_some()
+        || args.tls_fingerprint.is_some()
+        || args.tls_insecure;
+
+    let candidate_keys = if !args.key.is_empty() {
+        let mut keys = Vec::new();
+        for path in &args.key {
+            let k = load_private_key(Path::new(path), args.passphrase.as_deref())?;
+            info!("Loaded SSH private key from {}", path);
+            keys.push((PathBuf::from(path), k));
+        }
+        keys
+    } else if use_tls {
+        let keys = discover_default_keys(args.passphrase.as_deref());
+        if !keys.is_empty() {
+            info!("Auto-discovered {} SSH private key(s) from ~/.ssh/", keys.len());
+        }
+        keys
+    } else {
+        Vec::new()
+    };
+
     info!("Starting Tunner Client...");
     info!("Local listen address: {}:{}", args.interface, args.listen);
     info!(
-        "Remote tunnel server: {}:{}",
-        args.server, args.remote_port
+        "Remote tunnel server: {}:{} (TLS={}, candidate-keys={})",
+        args.server,
+        args.remote_port,
+        use_tls,
+        candidate_keys.len()
     );
     info!(
-        "Min rate floor: {} bytes/s, echo requested: {}, half-close timeout: {}s",
-        min_rate, args.echo, args.half_close_timeout
+        "Min rate floor: {} bytes/s, echo requested: {}",
+        min_rate, args.echo
     );
 
-    // 1. Connect to remote tunserver
+    // 1. Connect to remote tunserver (with optional TLS 1.3 + SSH key auth)
     let server_addr = format!("{}:{}", args.server, args.remote_port);
-    let tunnel_stream = match TcpStream::connect(&server_addr).await {
+    let tcp_stream = match TcpStream::connect(&server_addr).await {
         Ok(s) => {
             s.set_nodelay(true)?;
-            info!("Connected to tunnel server at {}", server_addr);
+            info!("Connected TCP to tunnel server at {}", server_addr);
             s
         }
         Err(e) => {
@@ -79,7 +125,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let (mut tunnel_read, mut tunnel_write) = tunnel_stream.into_split();
+    let (mut tunnel_read, mut tunnel_write): (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ) = if use_tls {
+        let connector = build_client_connector(
+            args.tls_ca.as_deref(),
+            args.tls_fingerprint.as_deref(),
+            args.tls_insecure,
+        )?;
+        let server_name = make_server_name(&args.server);
+        let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
+        info!("TLS 1.3 handshake completed with {}", server_addr);
+
+        match client_authenticate(&mut tls_stream, &candidate_keys).await {
+            Ok(Some(matched)) => {
+                info!("SSH key authentication succeeded using {}", matched.display());
+            }
+            Ok(None) => {
+                info!("Server does not require SSH key authentication.");
+            }
+            Err(e) => {
+                return Err(format!("SSH key authentication failed: {}", e).into());
+            }
+        }
+
+        let (r, w) = tokio::io::split(tls_stream);
+        (Box::new(r), Box::new(w))
+    } else {
+        let (r, w) = tokio::io::split(tcp_stream);
+        (Box::new(r), Box::new(w))
+    };
 
     // Channel for multiplexing blocks onto the tunnel
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<Block>(1024);
@@ -170,7 +246,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if let Some(tx) = maybe_tx {
                                 if tx.send(block).await.is_err() {
-                                    // Local connection receiver dropped
                                     let mut map = conns_reader.lock().await;
                                     map.remove(&conn_id);
                                 }
@@ -216,7 +291,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        // Drop all active connection senders so their tasks close sockets immediately
         conns_reader.lock().await.clear();
         let _ = shutdown_tx_reader.send(true);
     });
@@ -258,12 +332,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let tunnel_tx_conn = tunnel_tx.clone();
         let conns_conn = Arc::clone(&conns);
-        let half_close_timeout = Duration::from_secs(args.half_close_timeout);
 
         tokio::spawn(async move {
             let (mut socket_read, mut socket_write) = socket.into_split();
 
-            // Notify server of new connection
             if tunnel_tx_conn
                 .send(Block::new_control(conn_id, CODE_START))
                 .await
@@ -279,6 +351,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut read_closed = false;
             let mut write_closed = false;
             let mut aborted_by_remote = false;
+            let half_close_timeout = Duration::from_secs(60);
 
             loop {
                 tokio::select! {
@@ -335,7 +408,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             Some(_) => {}
                             None => {
-                                // Channel closed (server sent CODE_ABORT or tunnel closed)
                                 aborted_by_remote = true;
                                 break;
                             }
@@ -348,8 +420,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Cleanup: both socket_read and socket_write are dropped when this task returns,
-            // ensuring the OS file descriptor is always closed immediately.
             if !write_closed {
                 let _ = socket_write.shutdown().await;
             }

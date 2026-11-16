@@ -266,3 +266,116 @@ async fn test_tcp_half_close_preserves_response() -> Result<(), Box<dyn std::err
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_tls_ssh_key_auth_success_and_reject() -> Result<(), Box<dyn std::error::Error>> {
+    use ssh_key::{Algorithm, LineEnding, PrivateKey};
+
+    let server_bin = env!("CARGO_BIN_EXE_tunserver");
+    let client_bin = env!("CARGO_BIN_EXE_tunclient");
+
+    // Generate two authorized keys and one unauthorized key
+    let mut rng = rand::thread_rng();
+    let key1 = PrivateKey::random(&mut rng, Algorithm::Ed25519)?;
+    let key2 = PrivateKey::random(&mut rng, Algorithm::Ed25519)?;
+    let bad_key = PrivateKey::random(&mut rng, Algorithm::Ed25519)?;
+
+    let tmp_dir = std::env::temp_dir();
+    let auth_keys_path = tmp_dir.join("test_tunner_authorized_keys");
+    let key2_path = tmp_dir.join("test_tunner_id_ed25519_2");
+    let bad_key_path = tmp_dir.join("test_tunner_id_ed25519_bad");
+
+    let auth_contents = format!(
+        "{}\n{}\n",
+        key1.public_key().to_openssh()?,
+        key2.public_key().to_openssh()?
+    );
+    std::fs::write(&auth_keys_path, auth_contents)?;
+    key2.write_openssh_file(&key2_path, LineEnding::LF)?;
+    bad_key.write_openssh_file(&bad_key_path, LineEnding::LF)?;
+
+    let tunnel_port = 18400;
+    let echo_port = 18401;
+    let client_port = 18402;
+
+    // Start TunServer with TLS + authorized_keys (multiple keys)
+    let _server_proc = ProcessGuard(
+        Command::new(server_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &tunnel_port.to_string(),
+                "-f",
+                &echo_port.to_string(),
+                "-m",
+                "test",
+                "--authorized-keys",
+                auth_keys_path.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let _probe = wait_for_port(tunnel_port, 30).await?;
+    drop(_probe);
+
+    // 1. Unauthorized key should be rejected by server and exit non-zero
+    let bad_status = Command::new(client_bin)
+        .args([
+            "-i",
+            "127.0.0.1",
+            "-l",
+            "18403",
+            "-r",
+            &tunnel_port.to_string(),
+            "-k",
+            bad_key_path.to_str().unwrap(),
+            "--tls-insecure",
+            "127.0.0.1",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    assert!(!bad_status.success(), "Unauthorized key should be rejected");
+
+    // 2. Multi-key fallback: pass bad_key first, then authorized key2 -> should try bad_key, fallback to key2, and succeed
+    let _client_proc = ProcessGuard(
+        Command::new(client_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &client_port.to_string(),
+                "-r",
+                &tunnel_port.to_string(),
+                "-k",
+                bad_key_path.to_str().unwrap(),
+                "-k",
+                key2_path.to_str().unwrap(),
+                "--tls-insecure",
+                "-n",
+                "10k",
+                "127.0.0.1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let mut stream = wait_for_port(client_port, 30).await?;
+    let msg = b"Authenticated over TLS 1.3 + SSH key!\n";
+    stream.write_all(msg).await?;
+    stream.shutdown().await?;
+
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await?;
+    assert_eq!(resp, msg);
+
+    let _ = std::fs::remove_file(auth_keys_path);
+    let _ = std::fs::remove_file(key2_path);
+    let _ = std::fs::remove_file(bad_key_path);
+
+    Ok(())
+}
