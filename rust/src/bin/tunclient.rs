@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use clap::Parser;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::interval;
 use tunner::{
     codec::{read_block, write_block},
-    next_sequence, parse_rate, Block, BlockType, NoiseSource, CODE_ABORT, CODE_ECHO, CODE_NOISE,
-    CODE_START, MAX_NO_PADDING_LENGTH,
+    next_sequence, parse_rate, Block, BlockType, NoiseSource, CODE_ABORT, CODE_ECHO, CODE_EOF,
+    CODE_NOISE, CODE_START, MAX_NO_PADDING_LENGTH,
 };
 
 #[derive(Parser, Debug)]
@@ -172,13 +172,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     map.remove(&conn_id);
                                 }
                             } else {
-                                warn!("Received data for non-existing conn {:08x}", conn_id);
+                                debug!("Received data for already-closed conn {:08x}", conn_id);
                                 let _ = tunnel_tx_reader
                                     .send(Block::new_control(conn_id, CODE_ABORT))
                                     .await;
                             }
                         }
                         BlockType::Control { code } => match code {
+                            CODE_EOF => {
+                                let maybe_tx = {
+                                    let map = conns_reader.lock().await;
+                                    map.get(&conn_id).cloned()
+                                };
+                                if let Some(tx) = maybe_tx {
+                                    let _ = tx.send(block).await;
+                                }
+                            }
                             CODE_ABORT => {
                                 info!("Server closed conn {:08x}", conn_id);
                                 let mut map = conns_reader.lock().await;
@@ -263,15 +272,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut buf = vec![0u8; MAX_NO_PADDING_LENGTH];
             let mut req_seq: u16 = 0;
             let mut expected_seq: u16 = 0;
+            let mut read_closed = false;
+            let mut write_closed = false;
             let mut aborted_by_remote = false;
+            let half_close_timeout = Duration::from_secs(60);
 
             loop {
                 tokio::select! {
-                    read_res = socket_read.read(&mut buf) => {
+                    read_res = socket_read.read(&mut buf), if !read_closed => {
                         match read_res {
                             Ok(0) => {
-                                info!("Local socket {:08x} EOF, closing.", conn_id);
-                                break;
+                                info!("Local socket {:08x} read EOF (half-close).", conn_id);
+                                read_closed = true;
+                                if tunnel_tx_conn.send(Block::new_control(conn_id, CODE_EOF)).await.is_err() {
+                                    break;
+                                }
+                                if write_closed {
+                                    break;
+                                }
                             }
                             Ok(n) => {
                                 let data = Bytes::copy_from_slice(&buf[..n]);
@@ -287,9 +305,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    maybe_block = resp_rx.recv() => {
+                    maybe_block = resp_rx.recv(), if !write_closed => {
                         match maybe_block {
-                            Some(block) => {
+                            Some(block) if block.is_data() => {
                                 let seq = block.sequence();
                                 if seq != expected_seq {
                                     error!(
@@ -304,6 +322,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     break;
                                 }
                             }
+                            Some(block) if block.control_code() == CODE_EOF => {
+                                info!("Remote {:08x} sent EOF (half-close).", conn_id);
+                                let _ = socket_write.shutdown().await;
+                                write_closed = true;
+                                if read_closed {
+                                    break;
+                                }
+                            }
+                            Some(_) => {}
                             None => {
                                 // Channel closed (server sent CODE_ABORT or tunnel closed)
                                 aborted_by_remote = true;
@@ -311,17 +338,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    _ = tokio::time::sleep(half_close_timeout), if read_closed || write_closed => {
+                        warn!("Half-closed conn {:08x} timed out, closing.", conn_id);
+                        break;
+                    }
                 }
             }
 
             // Cleanup: both socket_read and socket_write are dropped when this task returns,
             // ensuring the OS file descriptor is always closed immediately.
-            let _ = socket_write.shutdown().await;
+            if !write_closed {
+                let _ = socket_write.shutdown().await;
+            }
             {
                 let mut map = conns_conn.lock().await;
                 map.remove(&conn_id);
             }
-            if !aborted_by_remote {
+            if !aborted_by_remote && !(read_closed && write_closed) {
                 let _ = tunnel_tx_conn
                     .send(Block::new_control(conn_id, CODE_ABORT))
                     .await;

@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use clap::Parser;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tunner::{
     codec::{read_block, write_block},
-    next_sequence, Block, BlockType, CODE_ABORT, CODE_ECHO, CODE_NOISE, CODE_START,
+    next_sequence, Block, BlockType, CODE_ABORT, CODE_ECHO, CODE_EOF, CODE_NOISE, CODE_START,
     MAX_NO_PADDING_LENGTH,
 };
 
@@ -150,13 +150,25 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
                                     tokio::spawn(async move {
                                         let mut buf = vec![0u8; MAX_NO_PADDING_LENGTH];
                                         let mut res_seq: u16 = 0;
+                                        let mut read_closed = false;
+                                        let mut write_closed = false;
                                         let mut aborted_by_client = false;
+                                        let half_close_timeout = Duration::from_secs(60);
 
                                         loop {
                                             tokio::select! {
-                                                read_res = backend_read.read(&mut buf) => {
+                                                read_res = backend_read.read(&mut buf), if !read_closed => {
                                                     match read_res {
-                                                        Ok(0) => break, // Backend EOF
+                                                        Ok(0) => {
+                                                            // Backend EOF (half-close)
+                                                            read_closed = true;
+                                                            if tunnel_tx_clone.send(Block::new_control(conn_id, CODE_EOF)).await.is_err() {
+                                                                break;
+                                                            }
+                                                            if write_closed {
+                                                                break;
+                                                            }
+                                                        }
                                                         Ok(n) => {
                                                             let data = Bytes::copy_from_slice(&buf[..n]);
                                                             let blk = Block::new_data(conn_id, res_seq, data);
@@ -168,9 +180,9 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
                                                         Err(_) => break,
                                                     }
                                                 }
-                                                maybe_blk = rx.recv() => {
+                                                maybe_blk = rx.recv(), if !write_closed => {
                                                     match maybe_blk {
-                                                        Some(blk) => {
+                                                        Some(blk) if blk.is_data() => {
                                                             if let Err(e) = backend_write.write_all(&blk.data).await {
                                                                 error!(
                                                                     "Failed writing to backend {:08x}: {}",
@@ -179,6 +191,14 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
                                                                 break;
                                                             }
                                                         }
+                                                        Some(blk) if blk.control_code() == CODE_EOF => {
+                                                            let _ = backend_write.shutdown().await;
+                                                            write_closed = true;
+                                                            if read_closed {
+                                                                break;
+                                                            }
+                                                        }
+                                                        Some(_) => {}
                                                         None => {
                                                             // Client sent CODE_ABORT or tunnel closed
                                                             aborted_by_client = true;
@@ -186,17 +206,23 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
                                                         }
                                                     }
                                                 }
+                                                _ = tokio::time::sleep(half_close_timeout), if read_closed || write_closed => {
+                                                    warn!("Half-closed backend conn {:08x} timed out, closing.", conn_id);
+                                                    break;
+                                                }
                                             }
                                         }
 
                                         // Both backend_read and backend_write are dropped when this task returns,
                                         // ensuring the backend OS file descriptor is closed immediately.
-                                        let _ = backend_write.shutdown().await;
+                                        if !write_closed {
+                                            let _ = backend_write.shutdown().await;
+                                        }
                                         {
                                             let mut map = conns_clone.lock().await;
                                             map.remove(&conn_id);
                                         }
-                                        if !aborted_by_client {
+                                        if !aborted_by_client && !(read_closed && write_closed) {
                                             let _ = tunnel_tx_clone
                                                 .send(Block::new_control(conn_id, CODE_ABORT))
                                                 .await;
@@ -221,6 +247,15 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
                                         .send(Block::new_control(conn_id, CODE_ABORT))
                                         .await;
                                 }
+                            }
+                        }
+                        CODE_EOF => {
+                            let maybe_tx = {
+                                let map = connections.lock().await;
+                                map.get(&conn_id).cloned()
+                            };
+                            if let Some(tx) = maybe_tx {
+                                let _ = tx.send(block).await;
                             }
                         }
                         CODE_ABORT => {
@@ -261,7 +296,7 @@ async fn handle_tunnel(tunnel_socket: TcpStream, backend_host: String, backend_p
                                 map.remove(&conn_id);
                             }
                         } else {
-                            warn!("Received data for unknown conn {:08x}", conn_id);
+                            debug!("Received data for already-closed conn {:08x}", conn_id);
                             let _ = tunnel_tx
                                 .send(Block::new_control(conn_id, CODE_ABORT))
                                 .await;

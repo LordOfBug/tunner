@@ -18,6 +18,7 @@ public class Block {
     public final static short CODE_START = 1; // start a connection
     public final static short CODE_RESUME = 2;
     public final static short CODE_NOISE = 3; // noise/dummy data, discard without echo
+    public final static short CODE_EOF = 4;   // half-close (FIN)
     public final static short CODE_ABORT = (short)0x00FF;
 
     /**

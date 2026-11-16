@@ -190,3 +190,79 @@ async fn test_no_fd_leak_on_server_close() -> Result<(), Box<dyn std::error::Err
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_tcp_half_close_preserves_response() -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::net::TcpListener;
+
+    let server_bin = env!("CARGO_BIN_EXE_tunserver");
+    let client_bin = env!("CARGO_BIN_EXE_tunclient");
+
+    let tunnel_port = 18300;
+    let backend_port = 18301;
+    let client_port = 18302;
+
+    // Mock backend that reads until client EOF (FIN) before sending its response
+    let backend_listener = TcpListener::bind(format!("127.0.0.1:{}", backend_port)).await?;
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut sock, _)) = backend_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let _ = sock.read_to_end(&mut req).await;
+                    if req == b"REQUEST_BEFORE_FIN\n" {
+                        let _ = sock.write_all(b"RESPONSE_AFTER_CLIENT_EOF\n").await;
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        }
+    });
+
+    let _server_proc = ProcessGuard(
+        Command::new(server_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &tunnel_port.to_string(),
+                "-f",
+                &backend_port.to_string(),
+                "-m",
+                "prod",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let _probe = wait_for_port(tunnel_port, 30).await?;
+    drop(_probe);
+
+    let _client_proc = ProcessGuard(
+        Command::new(client_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &client_port.to_string(),
+                "-r",
+                &tunnel_port.to_string(),
+                "127.0.0.1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let mut stream = wait_for_port(client_port, 30).await?;
+    stream.write_all(b"REQUEST_BEFORE_FIN\n").await?;
+    // Half-close write side (send TCP FIN) while keeping read side open
+    stream.shutdown().await?;
+
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await?;
+    assert_eq!(resp, b"RESPONSE_AFTER_CLIENT_EOF\n");
+
+    Ok(())
+}

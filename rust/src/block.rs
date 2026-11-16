@@ -7,6 +7,7 @@ pub const CODE_ECHO: u16 = 0;
 pub const CODE_START: u16 = 1;
 pub const CODE_RESUME: u16 = 2;
 pub const CODE_NOISE: u16 = 3;
+pub const CODE_EOF: u16 = 4;
 pub const CODE_ABORT: u16 = 0x00FF;
 
 pub const MAX_LENGTH: usize = 0xFFFF;
