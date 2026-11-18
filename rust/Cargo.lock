@@ -1485,15 +1485,18 @@ dependencies = [
 name = "tunner"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "clap",
  "env_logger",
  "log",
  "rand",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "sha2",
+ "socket2",
  "ssh-key",
  "tokio",
  "tokio-rustls",

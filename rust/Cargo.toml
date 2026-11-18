@@ -17,6 +17,9 @@ rustls-pemfile = "2"
 rcgen = "0.13"
 ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa", "encryption", "rand_core"] }
 sha2 = "0.10"
+socket2 = "0.6"
+base64 = "0.22"
+ring = "0.17"
 
 [[bin]]
 name = "tunclient"

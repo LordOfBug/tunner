@@ -5,9 +5,14 @@ pub const BLOCK_CONTROL: u16 = 0x8000;
 
 pub const CODE_ECHO: u16 = 0;
 pub const CODE_START: u16 = 1;
+/// Receiver allows sender to resume reading its local socket for this conn.
 pub const CODE_RESUME: u16 = 2;
 pub const CODE_NOISE: u16 = 3;
 pub const CODE_EOF: u16 = 4;
+/// Receiver asks sender to stop reading its local socket for this conn (backpressure).
+pub const CODE_PAUSE: u16 = 5;
+/// Keepalive frame (conn_id 0); any received frame refreshes liveness.
+pub const CODE_PING: u16 = 6;
 pub const CODE_ABORT: u16 = 0x00FF;
 
 pub const MAX_LENGTH: usize = 0xFFFF;
@@ -61,7 +66,7 @@ impl Block {
             }
         } else if tag == BLOCK_CONTROL {
             BlockType::Control {
-                code: self.type_seq & 0x00FF,
+                code: self.type_seq & 0x3FFF,
             }
         } else {
             BlockType::Unknown(self.type_seq)
@@ -77,7 +82,7 @@ impl Block {
     }
 
     pub fn control_code(&self) -> u16 {
-        self.type_seq & 0x00FF
+        self.type_seq & 0x3FFF
     }
 
     pub fn length(&self) -> usize {

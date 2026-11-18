@@ -1,5 +1,5 @@
 use crate::block::{Block, PADDING_BYTE};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::io::{Error, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -38,7 +38,18 @@ pub async fn read_block<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
     }))
 }
 
+/// Write a block and flush immediately.
 pub async fn write_block<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    block: &Block,
+) -> std::io::Result<()> {
+    write_block_noflush(writer, block).await?;
+    writer.flush().await
+}
+
+/// Write a block without flushing (intended for use with a `BufWriter` so
+/// multiple queued blocks are coalesced into one flush / TLS record).
+pub async fn write_block_noflush<W: AsyncWrite + Unpin>(
     writer: &mut W,
     block: &Block,
 ) -> std::io::Result<()> {
@@ -52,23 +63,20 @@ pub async fn write_block<W: AsyncWrite + Unpin>(
 
     let rem = len % 8;
     let pad_len = if rem == 0 { 0 } else { 8 - rem };
-    let total_len = 8 + len + pad_len;
 
-    let mut buf = BytesMut::with_capacity(total_len);
-    buf.extend_from_slice(&block.type_seq.to_be_bytes());
-    buf.extend_from_slice(&(len as u16).to_be_bytes());
-    buf.extend_from_slice(&block.conn_id.to_be_bytes());
+    let mut header = [0u8; 8];
+    header[0..2].copy_from_slice(&block.type_seq.to_be_bytes());
+    header[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+    header[4..8].copy_from_slice(&block.conn_id.to_be_bytes());
+    writer.write_all(&header).await?;
 
     if len > 0 {
-        buf.extend_from_slice(&block.data);
+        writer.write_all(&block.data).await?;
     }
 
     if pad_len > 0 {
-        buf.resize(total_len, PADDING_BYTE);
+        writer.write_all(&[PADDING_BYTE; 8][..pad_len]).await?;
     }
-
-    writer.write_all(&buf).await?;
-    writer.flush().await?;
     Ok(())
 }
 

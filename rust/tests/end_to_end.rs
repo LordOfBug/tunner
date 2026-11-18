@@ -379,3 +379,310 @@ async fn test_tls_ssh_key_auth_success_and_reject() -> Result<(), Box<dyn std::e
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_websocket_tls_auth_and_404_probe_defense() -> Result<(), Box<dyn std::error::Error>> {
+    use ssh_key::{Algorithm, LineEnding, PrivateKey};
+    use tunner::tls::{build_client_connector, make_server_name};
+
+    let server_bin = env!("CARGO_BIN_EXE_tunserver");
+    let client_bin = env!("CARGO_BIN_EXE_tunclient");
+
+    let mut rng = rand::thread_rng();
+    let key = PrivateKey::random(&mut rng, Algorithm::Ed25519)?;
+    let bad_key = PrivateKey::random(&mut rng, Algorithm::Ed25519)?;
+
+    let tmp_dir = std::env::temp_dir();
+    let auth_keys_path = tmp_dir.join("test_ws_authorized_keys");
+    let key_path = tmp_dir.join("test_ws_id_ed25519");
+    let bad_key_path = tmp_dir.join("test_ws_id_ed25519_bad");
+
+    std::fs::write(
+        &auth_keys_path,
+        format!("{}\n", key.public_key().to_openssh()?),
+    )?;
+    key.write_openssh_file(&key_path, LineEnding::LF)?;
+    bad_key.write_openssh_file(&bad_key_path, LineEnding::LF)?;
+
+    let tunnel_port = 18500;
+    let echo_port = 18501;
+    let client_port = 18502;
+
+    let _server_proc = ProcessGuard(
+        Command::new(server_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &tunnel_port.to_string(),
+                "-f",
+                &echo_port.to_string(),
+                "-m",
+                "test",
+                "--tls",
+                "--ws-path",
+                "/secret-tunnel",
+                "--authorized-keys",
+                auth_keys_path.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let _probe = wait_for_port(tunnel_port, 30).await?;
+    drop(_probe);
+
+    // 1. Active probe (normal GET /) must receive HTTP/1.1 404 Not Found
+    let connector = build_client_connector(None, None, true)?;
+    let tcp = TcpStream::connect(format!("127.0.0.1:{}", tunnel_port)).await?;
+    let mut tls = connector
+        .connect(make_server_name("127.0.0.1"), tcp)
+        .await?;
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await?;
+    let mut probe_resp = Vec::new();
+    tls.read_to_end(&mut probe_resp).await?;
+    let probe_str = String::from_utf8_lossy(&probe_resp);
+    assert!(
+        probe_str.starts_with("HTTP/1.1 404 Not Found"),
+        "Expected 404 for active probe, got: {}",
+        probe_str
+    );
+
+    // 2. Unauthorized key on /secret-tunnel must be rejected (404) and client exits non-zero
+    let bad_status = Command::new(client_bin)
+        .args([
+            "-i",
+            "127.0.0.1",
+            "-l",
+            "18503",
+            "-r",
+            &tunnel_port.to_string(),
+            "--ws-path",
+            "/secret-tunnel",
+            "-k",
+            bad_key_path.to_str().unwrap(),
+            "--tls-insecure",
+            "127.0.0.1",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    assert!(!bad_status.success(), "Unauthorized WS key should fail");
+
+    // 3. Authorized key on /secret-tunnel succeeds and tunnels traffic over WebSocket + TLS
+    let _client_proc = ProcessGuard(
+        Command::new(client_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &client_port.to_string(),
+                "-r",
+                &tunnel_port.to_string(),
+                "--ws-path",
+                "/secret-tunnel",
+                "-k",
+                key_path.to_str().unwrap(),
+                "--tls-insecure",
+                "127.0.0.1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let mut stream = wait_for_port(client_port, 30).await?;
+    let payload: Vec<u8> = (0..32768).map(|i| (i % 251) as u8).collect();
+    stream.write_all(&payload).await?;
+    stream.shutdown().await?;
+
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await?;
+    assert_eq!(resp, payload);
+
+    let _ = std::fs::remove_file(auth_keys_path);
+    let _ = std::fs::remove_file(key_path);
+    let _ = std::fs::remove_file(bad_key_path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_pause_resume_no_head_of_line_blocking() -> Result<(), Box<dyn std::error::Error>> {
+    let server_bin = env!("CARGO_BIN_EXE_tunserver");
+    let client_bin = env!("CARGO_BIN_EXE_tunclient");
+
+    let tunnel_port = 18600;
+    let echo_port = 18601;
+    let client_port = 18602;
+
+    let _server_proc = ProcessGuard(
+        Command::new(server_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &tunnel_port.to_string(),
+                "-f",
+                &echo_port.to_string(),
+                "-m",
+                "test",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let _probe = wait_for_port(tunnel_port, 30).await?;
+    drop(_probe);
+
+    let _client_proc = ProcessGuard(
+        Command::new(client_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &client_port.to_string(),
+                "-r",
+                &tunnel_port.to_string(),
+                "127.0.0.1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    // Connection A: write 2.5 MB without reading yet (exceeds PAUSE_HIGH_WATERMARK = 1 MB)
+    let stalled_stream = wait_for_port(client_port, 30).await?;
+    let big_payload = vec![0xABu8; 2_500_000];
+    let payload_clone = big_payload.clone();
+    let (mut stalled_rd, mut stalled_wr) = stalled_stream.into_split();
+
+    // Connection B: while A's receive queue is stalled/paused, B must still work without blocking
+    let write_and_stalled = async move {
+        let writer = tokio::spawn(async move {
+            stalled_wr.write_all(&payload_clone).await.unwrap();
+            stalled_wr.shutdown().await.unwrap();
+        });
+
+        // Give A time to flood over 1 MB so PAUSE triggers
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Verify Connection B completes 20 fast ping-pongs while A is not reading
+        let mut fast_stream = TcpStream::connect(format!("127.0.0.1:{}", client_port)).await?;
+        for i in 0..20u32 {
+            let msg = format!("fast-ping-{}\n", i);
+            fast_stream.write_all(msg.as_bytes()).await?;
+            let mut reply = vec![0u8; msg.len()];
+            tokio::time::timeout(Duration::from_secs(2), fast_stream.read_exact(&mut reply))
+                .await
+                .map_err(|_| "Head-of-line blocking detected: fast stream timed out!")??;
+            assert_eq!(reply, msg.as_bytes());
+        }
+        drop(fast_stream);
+
+        // Now drain Connection A (triggers RESUME and completes all 2.5 MB)
+        let mut drained = Vec::with_capacity(big_payload.len());
+        stalled_rd.read_to_end(&mut drained).await?;
+        writer.await?;
+        assert_eq!(drained.len(), big_payload.len());
+        assert_eq!(drained, big_payload);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+
+    write_and_stalled.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_auto_reconnect() -> Result<(), Box<dyn std::error::Error>> {
+    let server_bin = env!("CARGO_BIN_EXE_tunserver");
+    let client_bin = env!("CARGO_BIN_EXE_tunclient");
+
+    let tunnel_port = 18700;
+    let echo_port = 18701;
+    let client_port = 18702;
+
+    let server_proc_1 = ProcessGuard(
+        Command::new(server_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &tunnel_port.to_string(),
+                "-f",
+                &echo_port.to_string(),
+                "-m",
+                "test",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let _probe = wait_for_port(tunnel_port, 30).await?;
+    drop(_probe);
+
+    let _client_proc = ProcessGuard(
+        Command::new(client_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &client_port.to_string(),
+                "-r",
+                &tunnel_port.to_string(),
+                "127.0.0.1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    // 1. First request before server restart
+    let mut s1 = wait_for_port(client_port, 30).await?;
+    s1.write_all(b"before-restart\n").await?;
+    let mut buf1 = [0u8; 15];
+    s1.read_exact(&mut buf1).await?;
+    assert_eq!(&buf1, b"before-restart\n");
+    drop(s1);
+
+    // 2. Kill server and restart it
+    drop(server_proc_1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _server_proc_2 = ProcessGuard(
+        Command::new(server_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &tunnel_port.to_string(),
+                "-f",
+                &echo_port.to_string(),
+                "-m",
+                "test",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    // Wait for client supervisor to auto-reconnect and serve a new connection
+    let mut reconnected = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(mut s2) = TcpStream::connect(format!("127.0.0.1:{}", client_port)).await {
+            if s2.write_all(b"after-restart\n").await.is_ok() {
+                let mut buf2 = [0u8; 14];
+                if s2.read_exact(&mut buf2).await.is_ok() && &buf2 == b"after-restart\n" {
+                    reconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(reconnected, "tunclient did not auto-reconnect after server restart");
+    Ok(())
+}

@@ -100,13 +100,45 @@ pub fn build_client_connector(
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth()
     } else {
-        return Err(
-            "TLS enabled: please specify --tls-ca <PEM>, --tls-fingerprint <SHA256>, or --tls-insecure"
-                .into(),
-        );
+        let root_store = load_system_root_store()?;
+        ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
     };
 
     Ok(TlsConnector::from(Arc::new(config)))
+}
+
+fn load_system_root_store() -> Result<RootCertStore, Box<dyn std::error::Error>> {
+    const SYSTEM_CA_PATHS: &[&str] = &[
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/system/etc/security/cacerts",
+    ];
+
+    let mut root_store = RootCertStore::empty();
+    for path in SYSTEM_CA_PATHS {
+        let p = std::path::Path::new(path);
+        if p.is_file() {
+            if let Ok(file) = File::open(p) {
+                let mut reader = BufReader::new(file);
+                for cert in rustls_pemfile::certs(&mut reader).flatten() {
+                    let _ = root_store.add(cert);
+                }
+            }
+            if !root_store.is_empty() {
+                info!("Loaded {} system root CA certificates from {}", root_store.len(), path);
+                return Ok(root_store);
+            }
+        }
+    }
+
+    Err(
+        "No system root CA bundle found; please specify --tls-ca <PEM>, --tls-fingerprint <SHA256>, or --tls-insecure"
+            .into(),
+    )
 }
 
 pub fn make_server_name(host: &str) -> ServerName<'static> {
