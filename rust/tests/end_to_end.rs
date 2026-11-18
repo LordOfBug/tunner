@@ -471,7 +471,7 @@ async fn test_websocket_tls_auth_and_404_probe_defense() -> Result<(), Box<dyn s
         .status()?;
     assert!(!bad_status.success(), "Unauthorized WS key should fail");
 
-    // 3. Authorized key on /secret-tunnel succeeds and tunnels traffic over WebSocket + TLS
+    // 3. Authorized key on /secret-tunnel succeeds and tunnels traffic over WebSocket + TLS + noise
     let _client_proc = ProcessGuard(
         Command::new(client_bin)
             .args([
@@ -481,6 +481,8 @@ async fn test_websocket_tls_auth_and_404_probe_defense() -> Result<(), Box<dyn s
                 &client_port.to_string(),
                 "-r",
                 &tunnel_port.to_string(),
+                "-n",
+                "50k",
                 "--ws-path",
                 "/secret-tunnel",
                 "-k",
@@ -493,14 +495,22 @@ async fn test_websocket_tls_auth_and_404_probe_defense() -> Result<(), Box<dyn s
             .spawn()?,
     );
 
-    let mut stream = wait_for_port(client_port, 30).await?;
-    let payload: Vec<u8> = (0..32768).map(|i| (i % 251) as u8).collect();
-    stream.write_all(&payload).await?;
-    stream.shutdown().await?;
+    let stream = wait_for_port(client_port, 30).await?;
+    let payload: Vec<u8> = (0..128_000).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let (mut rd, mut wr) = stream.into_split();
+    let writer = tokio::spawn(async move {
+        for chunk in payload.chunks(4096) {
+            wr.write_all(chunk).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        wr.shutdown().await.unwrap();
+    });
 
     let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await?;
-    assert_eq!(resp, payload);
+    rd.read_to_end(&mut resp).await?;
+    writer.await?;
+    assert_eq!(resp, expected);
 
     let _ = std::fs::remove_file(auth_keys_path);
     let _ = std::fs::remove_file(key_path);

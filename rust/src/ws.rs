@@ -316,39 +316,61 @@ fn spawn_ws_pump<S>(stream: S, is_client: bool) -> DuplexStream
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (app_io, mut internal_io) = tokio::io::duplex(64 * 1024);
+    let (app_io, internal_io) = tokio::io::duplex(64 * 1024);
+    let (mut internal_rd, mut internal_wr) = tokio::io::split(internal_io);
     let (mut ws_rd, mut ws_wr) = tokio::io::split(stream);
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<(u8, Vec<u8>)>();
 
+    // Dedicated WebSocket reader task — never cancelled mid-frame by outbound writes
+    let ctrl_tx_rd = ctrl_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match read_ws_frame(&mut ws_rd).await {
+                Ok(Some((opcode, payload))) => match opcode {
+                    OP_BINARY | OP_TEXT | OP_CONT => {
+                        if !payload.is_empty() && internal_wr.write_all(&payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    OP_PING => {
+                        if ctrl_tx_rd.send((OP_PONG, payload)).is_err() {
+                            break;
+                        }
+                    }
+                    OP_PONG => {}
+                    OP_CLOSE => {
+                        let _ = ctrl_tx_rd.send((OP_CLOSE, Vec::new()));
+                        break;
+                    }
+                    _ => {}
+                },
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let _ = internal_wr.shutdown().await;
+    });
+
+    // Dedicated WebSocket writer task — never cancels incoming WebSocket frame reads
     tokio::spawn(async move {
         let mut out_buf = vec![0u8; 64 * 1024];
         loop {
             tokio::select! {
-                frame_res = read_ws_frame(&mut ws_rd) => {
-                    match frame_res {
-                        Ok(Some((opcode, payload))) => match opcode {
-                            OP_BINARY | OP_TEXT | OP_CONT => {
-                                if !payload.is_empty()
-                                    && internal_io.write_all(&payload).await.is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            OP_PING => {
-                                if write_ws_frame(&mut ws_wr, OP_PONG, &payload, is_client).await.is_err() {
-                                    break;
-                                }
-                            }
-                            OP_PONG => {}
-                            OP_CLOSE => {
-                                let _ = write_ws_frame(&mut ws_wr, OP_CLOSE, &[], is_client).await;
+                 biased;
+                ctrl_msg = ctrl_rx.recv() => {
+                    match ctrl_msg {
+                        Some((OP_PONG, payload)) => {
+                            if write_ws_frame(&mut ws_wr, OP_PONG, &payload, is_client).await.is_err() {
                                 break;
                             }
-                            _ => {}
-                        },
-                        Ok(None) | Err(_) => break,
+                        }
+                        Some((OP_CLOSE, _)) | None => {
+                            let _ = write_ws_frame(&mut ws_wr, OP_CLOSE, &[], is_client).await;
+                            break;
+                        }
+                        Some(_) => {}
                     }
                 }
-                read_res = internal_io.read(&mut out_buf) => {
+                read_res = internal_rd.read(&mut out_buf) => {
                     match read_res {
                         Ok(0) => {
                             let _ = write_ws_frame(&mut ws_wr, OP_CLOSE, &[], is_client).await;
@@ -364,7 +386,7 @@ where
                 }
             }
         }
-        let _ = internal_io.shutdown().await;
+        let _ = ws_wr.shutdown().await;
     });
 
     app_io
