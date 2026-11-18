@@ -11,10 +11,7 @@ use tokio::sync::watch;
 use tunner::{
     auth::{client_authenticate, discover_default_keys, load_private_key},
     configure_tunnel_socket,
-    mux::{
-        reset_socket, run_stream, run_tunnel, BlockHandler, BoxedIo, Keepalive, Session,
-        STREAM_READ_BUF,
-    },
+    mux::{run_stream, run_tunnel, BlockHandler, BoxedIo, Keepalive, Session, STREAM_READ_BUF},
     parse_rate,
     tls::{build_client_connector, make_server_name},
     ws::ws_client_connect,
@@ -364,7 +361,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Rejecting connection from {} while tunnel is reconnecting",
                 peer_addr
             );
-            reset_socket(&socket);
             continue;
         };
 
@@ -372,17 +368,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Accepted connection {:08x} from {}", conn_id, peer_addr);
 
         let rx = session.register(conn_id);
-        if session
-            .ctrl
-            .send(Block::new_control(conn_id, CODE_START))
-            .is_err()
-        {
-            session.unregister(conn_id);
-            reset_socket(&socket);
-            continue;
-        }
-
         tokio::spawn(async move {
+            if session
+                .data
+                .send(Block::new_control(conn_id, CODE_START))
+                .await
+                .is_err()
+            {
+                session.unregister(conn_id);
+                return;
+            }
             run_stream(conn_id, socket, rx, session).await;
         });
     }

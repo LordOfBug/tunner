@@ -82,12 +82,18 @@ impl BlockHandler for ServerHandler {
                         conn_id, target, e
                     );
                     session.unregister(conn_id);
-                    let _ = session.ctrl.send(Block::new_control(conn_id, CODE_ABORT));
+                    let _ = session
+                        .data
+                        .send(Block::new_control(conn_id, CODE_ABORT))
+                        .await;
                 }
                 Err(_) => {
                     warn!("Timed out connecting backend for {:08x} to {}", conn_id, target);
                     session.unregister(conn_id);
-                    let _ = session.ctrl.send(Block::new_control(conn_id, CODE_ABORT));
+                    let _ = session
+                        .data
+                        .send(Block::new_control(conn_id, CODE_ABORT))
+                        .await;
                 }
             }
         });

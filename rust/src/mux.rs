@@ -1,30 +1,26 @@
 //! Shared tunnel multiplexing core used by both `tunclient` and `tunserver`.
 //!
 //! Design:
-//! - One **writer task** per tunnel drains two queues: an unbounded, high-priority
-//!   control queue (PAUSE/RESUME/ABORT/PING) and a bounded data queue. Queued blocks
-//!   are coalesced into a single flush (one syscall / TLS record) per batch, and a
-//!   PING is emitted whenever the writer has been idle for the keepalive interval.
+//! - One **writer task** per tunnel drains a flow-control queue (`PAUSE`/`RESUME`) and
+//!   the main FIFO queue (`START`, `Data`, `EOF`, `ABORT`), encoding blocks into a single
+//!   contiguous `BytesMut` batch (up to 64 KB) per `write_all` + `flush`.
 //! - One **reader loop** per tunnel dispatches incoming blocks to per-connection
-//!   unbounded queues. It never awaits on a single connection, so one slow
-//!   connection can no longer stall the whole tunnel (no head-of-line blocking).
-//! - **Backpressure (XOFF/XON)**: the reader tracks bytes queued per connection.
-//!   Above `PAUSE_HIGH_WATERMARK` it sends `CODE_PAUSE`; the peer stops reading that
-//!   connection's local socket (TCP pushes back on the app). When the queue drains
-//!   below `RESUME_LOW_WATERMARK` the connection task sends `CODE_RESUME`.
-//! - **Liveness**: if nothing is received within the keepalive timeout the tunnel is
-//!   declared dead and torn down.
+//!   unbounded queues without ever blocking on a slow stream.
+//! - **Backpressure (XOFF/XON)**: above `PAUSE_HIGH_WATERMARK` the receiver sends
+//!   `CODE_PAUSE`; below `RESUME_LOW_WATERMARK` it sends `CODE_RESUME`.
+//! - **Clean socket close**: on stream exit, `wr.shutdown().await` sends a clean TCP
+//!   `FIN` so the OS kernel delivers all already-written bytes to the local application.
 
 use crate::block::*;
-use crate::codec::{read_block, write_block_noflush};
-use bytes::Bytes;
+use crate::codec::{encode_block, read_block};
+use bytes::{Bytes, BytesMut};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -33,13 +29,13 @@ use tokio::time::Instant;
 pub const PAUSE_HIGH_WATERMARK: usize = 1024 * 1024;
 /// Send RESUME once the queue drains to this many bytes.
 pub const RESUME_LOW_WATERMARK: usize = 256 * 1024;
-/// Max payload read from a local socket per data block (smaller blocks interleave better).
-pub const STREAM_READ_BUF: usize = 16 * 1024;
-/// Bounded shared data queue towards the tunnel writer (in blocks).
-const DATA_QUEUE_BLOCKS: usize = 256;
-/// Max bytes coalesced into a single flush.
-const MAX_BATCH_BYTES: usize = 256 * 1024;
-/// Tunnel socket buffer sizes.
+/// Max payload read from a local socket per data block.
+pub const STREAM_READ_BUF: usize = MAX_NO_PADDING_LENGTH;
+/// Bounded shared FIFO queue towards the tunnel writer (in blocks).
+const DATA_QUEUE_BLOCKS: usize = 1024;
+/// Max bytes coalesced into a single write_all + flush.
+const MAX_BATCH_BYTES: usize = 64 * 1024;
+/// Tunnel reader buffer size.
 const IO_BUF: usize = 64 * 1024;
 /// Idle timeout for a half-closed connection.
 const HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -78,7 +74,9 @@ pub struct StreamReceiver {
 /// Cheap, cloneable handle to a live tunnel session.
 #[derive(Clone)]
 pub struct Session {
+    /// Flow-control queue (`CODE_PAUSE`, `CODE_RESUME`, `CODE_ECHO`).
     pub ctrl: mpsc::UnboundedSender<Block>,
+    /// Main FIFO stream queue (`CODE_START`, `Data`, `CODE_EOF`, `CODE_ABORT`).
     pub data: mpsc::Sender<Block>,
     streams: Arc<Mutex<HashMap<u32, StreamHandle>>>,
 }
@@ -192,13 +190,7 @@ pub fn configure_tunnel_socket(s: &TcpStream) {
     let _ = socket2::SockRef::from(s).set_tcp_keepalive(&ka);
 }
 
-/// Close a TCP socket with RST (SO_LINGER=0) so the app sees an error instead of a clean EOF.
-pub fn reset_socket(s: &TcpStream) {
-    let _ = socket2::SockRef::from(s).set_linger(Some(Duration::ZERO));
-}
-
 /// Run a tunnel until it dies. Returns a human-readable reason.
-/// On exit all registered connections receive `Abort` (their local sockets get RST).
 pub async fn run_tunnel<S, H>(
     stream: S,
     session: Session,
@@ -235,13 +227,13 @@ where
 }
 
 async fn run_writer<W: AsyncWrite + Unpin>(
-    w: W,
+    mut w: W,
     mut ctrl_rx: mpsc::UnboundedReceiver<Block>,
     mut data_rx: mpsc::Receiver<Block>,
     ping_every: Option<Duration>,
     real_bytes: Option<Arc<AtomicU64>>,
 ) -> std::io::Result<()> {
-    let mut w = BufWriter::with_capacity(IO_BUF, w);
+    let mut buf = BytesMut::with_capacity(MAX_BATCH_BYTES + 16);
     let idle = ping_every.unwrap_or(Duration::from_secs(365 * 24 * 3600));
     let mut ctrl_open = true;
     let mut data_open = true;
@@ -272,12 +264,12 @@ async fn run_writer<W: AsyncWrite + Unpin>(
             _ = tokio::time::sleep_until(deadline) => Block::new_control(0, CODE_PING),
         };
 
+        buf.clear();
         count(&first);
-        let mut batch = 8 + first.length();
-        write_block_noflush(&mut w, &first).await?;
+        encode_block(&first, &mut buf)?;
 
-        // Coalesce whatever is already queued (control first) into this flush.
-        while batch < MAX_BATCH_BYTES {
+        // Coalesce any immediately waiting blocks up to 64 KB into a single write_all + flush
+        while buf.len() < MAX_BATCH_BYTES {
             let next = match ctrl_rx.try_recv() {
                 Ok(b) => b,
                 Err(_) => match data_rx.try_recv() {
@@ -286,9 +278,10 @@ async fn run_writer<W: AsyncWrite + Unpin>(
                 },
             };
             count(&next);
-            batch += 8 + next.length();
-            write_block_noflush(&mut w, &next).await?;
+            encode_block(&next, &mut buf)?;
         }
+
+        w.write_all(&buf).await?;
         w.flush().await?;
     }
 }
@@ -304,7 +297,6 @@ where
     H: BlockHandler,
 {
     let mut r = BufReader::with_capacity(IO_BUF, r);
-    // Remember ids we already answered with ABORT, to avoid one ABORT per stray block.
     let mut aborted_unknown: HashSet<u32> = HashSet::new();
 
     loop {
@@ -329,9 +321,8 @@ where
                 Some(h) => {
                     let len = block.data.len();
                     let queued = h.flow.queued.fetch_add(len, Ordering::SeqCst) + len;
-                    // Must flag PAUSE *before* handing over the data, so the connection
-                    // task is guaranteed to observe `pause_sent` when it drains.
-                    if queued > PAUSE_HIGH_WATERMARK && !h.flow.pause_sent.swap(true, Ordering::SeqCst)
+                    if queued > PAUSE_HIGH_WATERMARK
+                        && !h.flow.pause_sent.swap(true, Ordering::SeqCst)
                     {
                         debug!("conn {:08x}: {} bytes queued, sending PAUSE", conn_id, queued);
                         let _ = session.ctrl.send(Block::new_control(conn_id, CODE_PAUSE));
@@ -346,7 +337,7 @@ where
                     }
                     if aborted_unknown.insert(conn_id) {
                         debug!("Data for unknown/closed conn {:08x}, sending ABORT", conn_id);
-                        let _ = session.ctrl.send(Block::new_control(conn_id, CODE_ABORT));
+                        let _ = session.data.try_send(Block::new_control(conn_id, CODE_ABORT));
                     }
                 }
             },
@@ -357,7 +348,7 @@ where
                 CODE_ABORT => {
                     let removed = session.streams.lock().unwrap().remove(&conn_id);
                     if let Some(h) = removed {
-                        debug!("Peer aborted conn {:08x}", conn_id);
+                        debug!("Peer closed/aborted conn {:08x}", conn_id);
                         let _ = h.tx.send(StreamEvent::Abort);
                     }
                 }
@@ -375,11 +366,11 @@ where
 enum StreamEnd {
     /// Both directions closed cleanly (FIN both ways).
     Graceful,
-    /// Local socket failed (read/write error).
+    /// Local socket closed or errored.
     LocalError,
     /// Half-closed connection was idle too long.
     Timeout,
-    /// Peer aborted or tunnel died.
+    /// Peer sent CODE_ABORT or tunnel closed.
     RemoteAbort,
 }
 
@@ -393,29 +384,30 @@ fn log_local_io_error(conn_id: u32, op: &str, e: &std::io::Error) {
 }
 
 /// Pump one local TCP socket <-> the tunnel until the connection ends.
-/// The caller must have registered `conn_id` (and, on the client, sent `CODE_START`).
-pub async fn run_stream(conn_id: u32, mut socket: TcpStream, rx: StreamReceiver, session: Session) {
-    let end = {
-        let (rd, wr) = socket.split();
-        stream_loop(conn_id, rd, wr, rx, &session).await
-    };
+pub async fn run_stream(conn_id: u32, socket: TcpStream, rx: StreamReceiver, session: Session) {
+    let (mut rd, mut wr) = socket.into_split();
+    let mut write_closed = false;
+    let end = stream_loop(conn_id, &mut rd, &mut wr, &mut write_closed, rx, &session).await;
+
+    if !write_closed {
+        let _ = wr.shutdown().await;
+    }
     session.unregister(conn_id);
 
-    match end {
-        StreamEnd::Graceful => {}
-        StreamEnd::RemoteAbort => reset_socket(&socket),
-        StreamEnd::LocalError | StreamEnd::Timeout => {
-            let _ = session.data.send(Block::new_control(conn_id, CODE_ABORT)).await;
-            reset_socket(&socket);
-        }
+    if matches!(end, StreamEnd::LocalError | StreamEnd::Timeout) {
+        let _ = session
+            .data
+            .send(Block::new_control(conn_id, CODE_ABORT))
+            .await;
     }
     info!("Connection {:08x} terminated ({:?}).", conn_id, end);
 }
 
 async fn stream_loop<R, W>(
     conn_id: u32,
-    mut rd: R,
-    mut wr: W,
+    rd: &mut R,
+    wr: &mut W,
+    write_closed: &mut bool,
     mut rx: StreamReceiver,
     session: &Session,
 ) -> StreamEnd
@@ -426,7 +418,6 @@ where
     let mut buf = vec![0u8; STREAM_READ_BUF];
     let mut seq: u16 = 0;
     let mut read_closed = false;
-    let mut write_closed = false;
     let mut paused = false;
 
     loop {
@@ -438,7 +429,7 @@ where
                     if session.data.send(Block::new_control(conn_id, CODE_EOF)).await.is_err() {
                         return StreamEnd::RemoteAbort;
                     }
-                    if write_closed {
+                    if *write_closed {
                         return StreamEnd::Graceful;
                     }
                 }
@@ -457,7 +448,7 @@ where
             ev = rx.rx.recv() => match ev {
                 Some(StreamEvent::Data(d)) => {
                     let len = d.len();
-                    if !write_closed {
+                    if !*write_closed {
                         if let Err(e) = wr.write_all(&d).await {
                             log_local_io_error(conn_id, "write", &e);
                             return StreamEnd::LocalError;
@@ -471,9 +462,9 @@ where
                 }
                 Some(StreamEvent::Eof) => {
                     debug!("conn {:08x}: remote EOF (half-close)", conn_id);
-                    if !write_closed {
+                    if !*write_closed {
                         let _ = wr.shutdown().await;
-                        write_closed = true;
+                        *write_closed = true;
                     }
                     if read_closed {
                         return StreamEnd::Graceful;
@@ -483,7 +474,7 @@ where
                 Some(StreamEvent::Resume) => paused = false,
                 Some(StreamEvent::Abort) | None => return StreamEnd::RemoteAbort,
             },
-            _ = tokio::time::sleep(HALF_CLOSE_TIMEOUT), if read_closed || write_closed => {
+            _ = tokio::time::sleep(HALF_CLOSE_TIMEOUT), if read_closed || *write_closed => {
                 warn!("conn {:08x}: half-closed connection idle, closing", conn_id);
                 return StreamEnd::Timeout;
             }

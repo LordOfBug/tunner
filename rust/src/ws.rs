@@ -318,7 +318,8 @@ where
 {
     let (app_io, internal_io) = tokio::io::duplex(64 * 1024);
     let (mut internal_rd, mut internal_wr) = tokio::io::split(internal_io);
-    let (mut ws_rd, mut ws_wr) = tokio::io::split(stream);
+    let (ws_rd, mut ws_wr) = tokio::io::split(stream);
+    let mut ws_rd = tokio::io::BufReader::with_capacity(64 * 1024, ws_rd);
     let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<(u8, Vec<u8>)>();
 
     // Dedicated WebSocket reader task — never cancelled mid-frame by outbound writes
@@ -452,36 +453,29 @@ async fn write_ws_frame<W: AsyncWrite + Unpin>(
     let len = payload.len();
     let mask_bit = if mask { 0x80u8 } else { 0x00u8 };
 
-    let mut header = Vec::with_capacity(14);
-    header.push(0x80 | (opcode & 0x0F)); // FIN = 1
+    let mut frame = Vec::with_capacity(14 + len);
+    frame.push(0x80 | (opcode & 0x0F)); // FIN = 1
     if len < 126 {
-        header.push(mask_bit | (len as u8));
+        frame.push(mask_bit | (len as u8));
     } else if len <= u16::MAX as usize {
-        header.push(mask_bit | 126);
-        header.extend_from_slice(&(len as u16).to_be_bytes());
+        frame.push(mask_bit | 126);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
     } else {
-        header.push(mask_bit | 127);
-        header.extend_from_slice(&(len as u64).to_be_bytes());
+        frame.push(mask_bit | 127);
+        frame.extend_from_slice(&(len as u64).to_be_bytes());
     }
 
     if mask {
         let mut mask_key = [0u8; 4];
         rand::thread_rng().fill_bytes(&mut mask_key);
-        header.extend_from_slice(&mask_key);
-        writer.write_all(&header).await?;
-        if len > 0 {
-            let mut masked = payload.to_vec();
-            for (i, b) in masked.iter_mut().enumerate() {
-                *b ^= mask_key[i & 3];
-            }
-            writer.write_all(&masked).await?;
+        frame.extend_from_slice(&mask_key);
+        for (i, &b) in payload.iter().enumerate() {
+            frame.push(b ^ mask_key[i & 3]);
         }
-    } else {
-        writer.write_all(&header).await?;
-        if len > 0 {
-            writer.write_all(payload).await?;
-        }
+    } else if len > 0 {
+        frame.extend_from_slice(payload);
     }
 
+    writer.write_all(&frame).await?;
     writer.flush().await
 }

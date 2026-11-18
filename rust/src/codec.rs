@@ -1,5 +1,5 @@
 use crate::block::{Block, PADDING_BYTE};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::io::{Error, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -38,21 +38,8 @@ pub async fn read_block<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
     }))
 }
 
-/// Write a block and flush immediately.
-pub async fn write_block<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    block: &Block,
-) -> std::io::Result<()> {
-    write_block_noflush(writer, block).await?;
-    writer.flush().await
-}
-
-/// Write a block without flushing (intended for use with a `BufWriter` so
-/// multiple queued blocks are coalesced into one flush / TLS record).
-pub async fn write_block_noflush<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    block: &Block,
-) -> std::io::Result<()> {
+/// Encode a `Block` (header + payload + 8-byte alignment padding) into `buf`.
+pub fn encode_block(block: &Block, buf: &mut BytesMut) -> std::io::Result<()> {
     let len = block.data.len();
     if len > u16::MAX as usize {
         return Err(Error::new(
@@ -63,20 +50,30 @@ pub async fn write_block_noflush<W: AsyncWrite + Unpin>(
 
     let rem = len % 8;
     let pad_len = if rem == 0 { 0 } else { 8 - rem };
+    let total_len = 8 + len + pad_len;
 
-    let mut header = [0u8; 8];
-    header[0..2].copy_from_slice(&block.type_seq.to_be_bytes());
-    header[2..4].copy_from_slice(&(len as u16).to_be_bytes());
-    header[4..8].copy_from_slice(&block.conn_id.to_be_bytes());
-    writer.write_all(&header).await?;
+    buf.reserve(total_len);
+    buf.extend_from_slice(&block.type_seq.to_be_bytes());
+    buf.extend_from_slice(&(len as u16).to_be_bytes());
+    buf.extend_from_slice(&block.conn_id.to_be_bytes());
 
     if len > 0 {
-        writer.write_all(&block.data).await?;
+        buf.extend_from_slice(&block.data);
     }
 
     if pad_len > 0 {
-        writer.write_all(&[PADDING_BYTE; 8][..pad_len]).await?;
+        buf.extend_from_slice(&[PADDING_BYTE; 8][..pad_len]);
     }
     Ok(())
 }
 
+/// Write a block and flush immediately.
+pub async fn write_block<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    block: &Block,
+) -> std::io::Result<()> {
+    let mut buf = BytesMut::with_capacity(8 + block.data.len() + 8);
+    encode_block(block, &mut buf)?;
+    writer.write_all(&buf).await?;
+    writer.flush().await
+}
