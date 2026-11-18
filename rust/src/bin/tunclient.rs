@@ -11,7 +11,7 @@ use tokio::sync::watch;
 use tunner::{
     auth::{client_authenticate, discover_default_keys, load_private_key},
     configure_tunnel_socket,
-    metrics::{spawn_tsdb_reporter, Metrics, TsdbConfig},
+    metrics::{spawn_tsdb_reporter, Metrics, MonitoredTcpStream, TsdbConfig},
     mux::{run_stream, run_tunnel, BlockHandler, BoxedIo, Keepalive, Session, STREAM_READ_BUF},
     parse_rate,
     tls::{build_client_connector, make_server_name},
@@ -89,10 +89,12 @@ async fn establish_tunnel(
     args: &Args,
     use_tls: bool,
     candidate_keys: &[(PathBuf, PrivateKey)],
+    metrics: &Arc<Metrics>,
 ) -> Result<BoxedIo, Box<dyn std::error::Error + Send + Sync>> {
     let server_addr = format!("{}:{}", args.server, args.remote_port);
     let tcp_stream = TcpStream::connect(&server_addr).await?;
     configure_tunnel_socket(&tcp_stream);
+    let tcp_stream = MonitoredTcpStream::new(tcp_stream, Arc::clone(metrics));
     info!("Connected TCP to tunnel server at {}", server_addr);
 
     if use_tls {
@@ -256,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Establish initial tunnel connection before binding local port so auth/config errors fail fast
     let hs_start = Instant::now();
-    let initial_stream = establish_tunnel(&args, use_tls, &candidate_keys)
+    let initial_stream = establish_tunnel(&args, use_tls, &candidate_keys, &metrics)
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
     metrics
@@ -267,19 +269,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("connected to {}:{} ({})", args.server, args.remote_port, transport_mode),
     );
 
-    // 2. Bind local listener once; it stays alive across tunnel reconnections
-    let local_addr = format!("{}:{}", args.interface, args.listen);
-    let listener = TcpListener::bind(&local_addr).await?;
-    info!("Tunnel client listening on {}", local_addr);
-
     let noise_source = if min_rate > 0 {
         Some(Arc::new(NoiseSource::new(args.noise_file.as_deref())))
     } else {
         None
     };
 
-    let active_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
+    let (initial_session, initial_io) = Session::new_with_metrics(Arc::clone(&metrics));
+    let active_session: Arc<Mutex<Option<Session>>> =
+        Arc::new(Mutex::new(Some(initial_session.clone())));
     let (fatal_tx, mut fatal_rx) = watch::channel(false);
+
+    // 2. Bind local listener once; initial_session is already active before bind completes
+    let local_addr = format!("{}:{}", args.interface, args.listen);
+    let listener = TcpListener::bind(&local_addr).await?;
+    info!("Tunnel client listening on {}", local_addr);
 
     if let Some(tsdb_cfg) = TsdbConfig::resolve(
         args.tsdb_url.as_deref(),
@@ -303,18 +307,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keepalive = Keepalive::from_secs(args.keepalive);
 
     tokio::spawn(async move {
-        let mut current_stream = Some(initial_stream);
+        let mut current_stream = Some((initial_stream, initial_session, initial_io));
         let mut backoff_secs = 1u64;
 
         loop {
-            let stream = match current_stream.take() {
-                Some(s) => {
+            let (stream, session, io) = match current_stream.take() {
+                Some(initial) => {
                     backoff_secs = 1;
-                    s
+                    initial
                 }
                 None => {
                     let hs_t0 = Instant::now();
-                    match establish_tunnel(&sup_args, use_tls, &sup_keys).await {
+                    match establish_tunnel(&sup_args, use_tls, &sup_keys, &sup_metrics).await {
                         Ok(s) => {
                             info!(
                                 "Reconnected tunnel to {}:{}",
@@ -331,7 +335,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 format!("reconnected to {}:{}", sup_args.server, sup_args.remote_port),
                             );
                             backoff_secs = 1;
-                            s
+                            let (sess, sess_io) =
+                                Session::new_with_metrics(Arc::clone(&sup_metrics));
+                            *sup_session.lock().unwrap() = Some(sess.clone());
+                            (s, sess, sess_io)
                         }
                         Err(e) => {
                             let jitter_ms = rand::thread_rng().gen_range(0..500);
@@ -350,9 +357,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             };
-
-            let (session, io) = Session::new_with_metrics(Arc::clone(&sup_metrics));
-            *sup_session.lock().unwrap() = Some(session.clone());
 
             let (noise_stop_tx, noise_stop_rx) = watch::channel(false);
             let real_bytes = Arc::new(AtomicU64::new(0));

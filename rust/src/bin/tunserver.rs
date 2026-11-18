@@ -12,7 +12,7 @@ use tokio_rustls::TlsAcceptor;
 use tunner::{
     auth::{load_authorized_keys, server_authenticate, server_send_no_auth},
     configure_tunnel_socket,
-    metrics::{spawn_tsdb_reporter, Metrics, TsdbConfig},
+    metrics::{spawn_tsdb_reporter, Metrics, MonitoredTcpStream, TsdbConfig},
     mux::{run_stream, run_tunnel, BlockHandler, Keepalive, Session},
     tls::build_server_acceptor,
     ws::ws_server_accept,
@@ -249,6 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let conn_metrics = Arc::clone(&metrics);
 
         tokio::spawn(async move {
+            let tunnel_socket = MonitoredTcpStream::new(tunnel_socket, Arc::clone(&conn_metrics));
             if let Some(acceptor) = acceptor {
                 let mut tls_stream = match acceptor.accept(tunnel_socket).await {
                     Ok(s) => s,

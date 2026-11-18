@@ -30,12 +30,12 @@ use tokio::time::Instant;
 pub const PAUSE_HIGH_WATERMARK: usize = 1024 * 1024;
 /// Send RESUME once the queue drains to this many bytes.
 pub const RESUME_LOW_WATERMARK: usize = 256 * 1024;
-/// Max payload read from a local socket per data block.
-pub const STREAM_READ_BUF: usize = MAX_NO_PADDING_LENGTH;
+/// Max payload read from a local socket per data block (8 KB streams smoothly over high-RTT/lossy links).
+pub const STREAM_READ_BUF: usize = 8 * 1024;
 /// Bounded shared FIFO queue towards the tunnel writer (in blocks).
 const DATA_QUEUE_BLOCKS: usize = 1024;
-/// Max bytes coalesced into a single write_all + flush.
-const MAX_BATCH_BYTES: usize = 64 * 1024;
+/// Max bytes coalesced into a single write_all + flush (16 KB = 1 max TLS record).
+const MAX_BATCH_BYTES: usize = 16 * 1024;
 /// Tunnel reader buffer size.
 const IO_BUF: usize = 64 * 1024;
 /// Idle timeout for a half-closed connection.

@@ -280,6 +280,9 @@ pub struct Metrics {
     pub write_batches_total: AtomicU64,
     pub tunnel_reconnects_total: AtomicU64,
     pub auth_failures_total: AtomicU64,
+    pub tcp_retrans_total: AtomicU64,
+    pub tcp_loss_retrans_units: AtomicU64,
+    pub tcp_loss_sent_units: AtomicU64,
     logs: Mutex<Vec<(u64, &'static str, String)>>,
 }
 
@@ -311,6 +314,9 @@ impl Metrics {
             write_batches_total: AtomicU64::new(0),
             tunnel_reconnects_total: AtomicU64::new(0),
             auth_failures_total: AtomicU64::new(0),
+            tcp_retrans_total: AtomicU64::new(0),
+            tcp_loss_retrans_units: AtomicU64::new(0),
+            tcp_loss_sent_units: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
         })
     }
@@ -395,6 +401,8 @@ struct PrevSnapshot {
     conn_timeout: u64,
     bytes_tx: u64,
     write_batches: u64,
+    tcp_retrans_units: u64,
+    tcp_sent_units: u64,
 }
 
 fn push_json_escaped(out: &mut String, s: &str) {
@@ -482,6 +490,16 @@ fn build_push_payload(
         0.0
     };
 
+    let tcp_retrans_u = metrics.tcp_loss_retrans_units.load(Ordering::Relaxed);
+    let tcp_sent_u = metrics.tcp_loss_sent_units.load(Ordering::Relaxed);
+    let d_tcp_retrans = tcp_retrans_u.saturating_sub(prev.tcp_retrans_units);
+    let d_tcp_sent = tcp_sent_u.saturating_sub(prev.tcp_sent_units);
+    let packet_loss_pct = if d_tcp_sent > 0 {
+        ((d_tcp_retrans as f64 * 100.0) / (d_tcp_sent as f64)).min(100.0)
+    } else {
+        0.0
+    };
+
     prev.rtt_sum_us = rtt_sum;
     prev.rtt_count = rtt_cnt;
     prev.backend_sum_us = bc_sum;
@@ -493,6 +511,8 @@ fn build_push_payload(
     prev.conn_timeout = timeout;
     prev.bytes_tx = bytes_tx;
     prev.write_batches = write_batches;
+    prev.tcp_retrans_units = tcp_retrans_u;
+    prev.tcp_sent_units = tcp_sent_u;
 
     let handshake_ms = metrics.handshake_last_ms.load(Ordering::Relaxed);
     let active_streams = metrics.active_streams.load(Ordering::Relaxed);
@@ -502,6 +522,7 @@ fn build_push_payload(
     let noise_bytes_tx = metrics.noise_bytes_tx_total.load(Ordering::Relaxed);
     let reconnects = metrics.tunnel_reconnects_total.load(Ordering::Relaxed);
     let auth_failures = metrics.auth_failures_total.load(Ordering::Relaxed);
+    let tcp_retrans = metrics.tcp_retrans_total.load(Ordering::Relaxed);
 
     let logs: Vec<(u64, &'static str, String)> = {
         let mut guard = metrics.logs.lock().unwrap();
@@ -522,6 +543,7 @@ fn build_push_payload(
     let gauges: &[(&str, f64)] = &[
         ("tunner_rtt_ms", rtt_ms),
         ("tunner_rtt_max_ms", rtt_max_ms),
+        ("tunner_packet_loss_pct", packet_loss_pct),
         ("tunner_active_streams", active_streams as f64),
         ("tunner_handshake_ms", handshake_ms as f64),
         ("tunner_backend_connect_ms", bc_ms),
@@ -542,6 +564,7 @@ fn build_push_payload(
         ("tunner_noise_bytes_tx_total", noise_bytes_tx),
         ("tunner_reconnects_total", reconnects),
         ("tunner_auth_failures_total", auth_failures),
+        ("tunner_tcp_retrans_total", tcp_retrans),
     ];
 
     let mut first = true;
@@ -749,29 +772,29 @@ pub fn spawn_tsdb_reporter(
         }
     };
 
-    let tls = if endpoint.https {
-        match build_client_connector(None, None, false) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                warn!("Disabling HTTPS TSDB reporter (TLS init failed): {}", e);
-                return;
-            }
-        }
-    } else {
-        None
-    };
-
-    let host = detect_hostname();
-    info!(
-        "TSDB telemetry enabled -> {} (role={}, host={}, mode={}, every {}s)",
-        config.url,
-        role,
-        host,
-        mode,
-        config.interval.as_secs()
-    );
-
     tokio::spawn(async move {
+        let tls = if endpoint.https {
+            match build_client_connector(None, None, false) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!("Disabling HTTPS TSDB reporter (TLS init failed): {}", e);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let host = detect_hostname();
+        info!(
+            "TSDB telemetry enabled -> {} (role={}, host={}, mode={}, every {}s)",
+            config.url,
+            role,
+            host,
+            mode,
+            config.interval.as_secs()
+        );
+
         let mut prev = PrevSnapshot::default();
         let mut pending: VecDeque<String> = VecDeque::with_capacity(MAX_PENDING_PUSHES);
         let mut ticker = tokio::time::interval(config.interval);
@@ -848,4 +871,225 @@ mod tests {
         assert!(body.contains("\"tunner_rtt_ms\""));
         assert!(body.contains("quote \\\" and \\\\ newline\\nhere"));
     }
+
+    #[tokio::test]
+    async fn test_monitored_tcp_stream_samples_stats() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut b = [0u8; 4];
+            s.read_exact(&mut b).await.unwrap();
+            s.write_all(b"pong").await.unwrap();
+        });
+
+        let m = Metrics::new();
+        let raw = TcpStream::connect(addr).await.unwrap();
+        let mut client = MonitoredTcpStream::new(raw, Arc::clone(&m));
+        client.write_all(b"ping").await.unwrap();
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong");
+        client.sample_now();
+        drop(client);
+        server.await.unwrap();
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(m.tcp_loss_sent_units.load(Ordering::Relaxed) > 0);
+    }
+}
+
+/// Wrapper around the tunnel `TcpStream` that periodically samples OS kernel TCP
+/// retransmission statistics (`TCP_CONNECTION_INFO` on macOS, `TCP_INFO` on Linux)
+/// into `Metrics` (`tunner_packet_loss_pct` and `tunner_tcp_retrans_total`).
+pub struct MonitoredTcpStream {
+    inner: TcpStream,
+    metrics: Arc<Metrics>,
+    last_sample: Instant,
+    prev_retrans_pkts: u64,
+    prev_retrans_units: u64,
+    prev_sent_units: u64,
+}
+
+impl MonitoredTcpStream {
+    pub fn new(inner: TcpStream, metrics: Arc<Metrics>) -> Self {
+        Self {
+            inner,
+            metrics,
+            last_sample: Instant::now(),
+            prev_retrans_pkts: 0,
+            prev_retrans_units: 0,
+            prev_sent_units: 0,
+        }
+    }
+
+    pub fn sample_now(&mut self) {
+        if let Some((retrans_pkts, retrans_units, sent_units)) = sample_tcp_stats(&self.inner) {
+            let d_pkts = retrans_pkts.saturating_sub(self.prev_retrans_pkts);
+            let d_retrans = retrans_units.saturating_sub(self.prev_retrans_units);
+            let d_sent = sent_units.saturating_sub(self.prev_sent_units);
+            self.prev_retrans_pkts = retrans_pkts;
+            self.prev_retrans_units = retrans_units;
+            self.prev_sent_units = sent_units;
+
+            if d_pkts > 0 {
+                self.metrics
+                    .tcp_retrans_total
+                    .fetch_add(d_pkts, Ordering::Relaxed);
+            }
+            if d_retrans > 0 {
+                self.metrics
+                    .tcp_loss_retrans_units
+                    .fetch_add(d_retrans, Ordering::Relaxed);
+            }
+            if d_sent > 0 {
+                self.metrics
+                    .tcp_loss_sent_units
+                    .fetch_add(d_sent, Ordering::Relaxed);
+            }
+        }
+        self.last_sample = Instant::now();
+    }
+
+    #[inline]
+    fn maybe_sample(&mut self) {
+        if self.last_sample.elapsed() >= Duration::from_secs(1) {
+            self.sample_now();
+        }
+    }
+}
+
+impl Drop for MonitoredTcpStream {
+    fn drop(&mut self) {
+        self.sample_now();
+    }
+}
+
+impl AsyncRead for MonitoredTcpStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let res = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if res.is_ready() {
+            self.maybe_sample();
+        }
+        res
+    }
+}
+
+impl AsyncWrite for MonitoredTcpStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let res = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if res.is_ready() {
+            self.maybe_sample();
+        }
+        res
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.sample_now();
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C, align(8))]
+struct MacTcpConnectionInfo {
+    tcpi_state: u8,
+    tcpi_snd_wscale: u8,
+    tcpi_rcv_wscale: u8,
+    __pad1: u8,
+    tcpi_options: u32,
+    tcpi_flags: u32,
+    tcpi_rto: u32,
+    tcpi_maxseg: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_snd_wnd: u32,
+    tcpi_snd_sbbytes: u32,
+    tcpi_rcv_wnd: u32,
+    tcpi_rttcur: u32,
+    tcpi_srtt: u32,
+    tcpi_rttvar: u32,
+    tcpi_tfo_bitfields: u32,
+    tcpi_txpackets: u64,
+    tcpi_txbytes: u64,
+    tcpi_txretransmitbytes: u64,
+    tcpi_rxpackets: u64,
+    tcpi_rxbytes: u64,
+    tcpi_rxoutoforderbytes: u64,
+    tcpi_txretransmitpackets: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn sample_tcp_stats(stream: &TcpStream) -> Option<(u64, u64, u64)> {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        let mut info: MacTcpConnectionInfo = std::mem::zeroed();
+        let mut len = std::mem::size_of::<MacTcpConnectionInfo>() as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        if rc == 0 {
+            let retrans_pkts = if info.tcpi_txretransmitpackets > 0 {
+                info.tcpi_txretransmitpackets
+            } else if info.tcpi_txretransmitbytes > 0 {
+                let mss = (info.tcpi_maxseg as u64).max(1400);
+                (info.tcpi_txretransmitbytes + mss - 1) / mss
+            } else {
+                0
+            };
+            Some((retrans_pkts, info.tcpi_txretransmitbytes, info.tcpi_txbytes))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sample_tcp_stats(stream: &TcpStream) -> Option<(u64, u64, u64)> {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        let mut info: libc::tcp_info = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        if rc == 0 {
+            let retrans = info.tcpi_total_retrans as u64;
+            let sent = info.tcpi_segs_out as u64;
+            Some((retrans, retrans, sent))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn sample_tcp_stats(_stream: &TcpStream) -> Option<(u64, u64, u64)> {
+    None
 }

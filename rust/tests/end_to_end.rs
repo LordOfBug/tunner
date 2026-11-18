@@ -893,6 +893,8 @@ async fn test_tsdb_metrics_push_and_rtt() -> Result<(), Box<dyn std::error::Erro
 
     for key in [
         "\"tunner_rtt_ms\"",
+        "\"tunner_packet_loss_pct\"",
+        "\"tunner_tcp_retrans_total\"",
         "\"tunner_bytes_tx_total\"",
         "\"tunner_connections_started_total\"",
         "\"tunner_backend_connect_ms\"",

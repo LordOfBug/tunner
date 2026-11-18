@@ -87,7 +87,7 @@ Compiled binaries:
 
 ## Optional TSDB Telemetry (`tsdb.zoomphant.com`)
 
-Both `tunclient` and `tunserver` can push performance telemetry (RTT latency via `PING`/`PONG`, backend connect latency, failure rate, stream end counts, throughput, batch sizes, pause events, reconnects, auth failures, and structured events) to `POST /api/v1/push`.
+Both `tunclient` and `tunserver` can push performance telemetry (RTT latency via `PING`/`PONG`, kernel TCP packet loss % and retransmission counts, backend connect latency, failure rate, stream end counts, throughput, batch sizes, pause events, reconnects, auth failures, and structured events) to `POST /api/v1/push`.
 
 ### Configuration (in priority order)
 1. **CLI flags:** `--tsdb-url https://tsdb.zoomphant.com --tsdb-token <TOKEN> --tsdb-interval 15`
