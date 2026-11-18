@@ -13,6 +13,7 @@
 
 use crate::block::*;
 use crate::codec::{encode_block, read_block};
+use crate::metrics::Metrics;
 use bytes::{Bytes, BytesMut};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
@@ -74,10 +75,11 @@ pub struct StreamReceiver {
 /// Cheap, cloneable handle to a live tunnel session.
 #[derive(Clone)]
 pub struct Session {
-    /// Flow-control queue (`CODE_PAUSE`, `CODE_RESUME`, `CODE_ECHO`).
+    /// Flow-control queue (`CODE_PAUSE`, `CODE_RESUME`, `CODE_ECHO`, `CODE_PONG`).
     pub ctrl: mpsc::UnboundedSender<Block>,
     /// Main FIFO stream queue (`CODE_START`, `Data`, `CODE_EOF`, `CODE_ABORT`).
     pub data: mpsc::Sender<Block>,
+    pub metrics: Arc<Metrics>,
     streams: Arc<Mutex<HashMap<u32, StreamHandle>>>,
 }
 
@@ -89,12 +91,17 @@ pub struct SessionIo {
 
 impl Session {
     pub fn new() -> (Session, SessionIo) {
+        Self::new_with_metrics(Metrics::new())
+    }
+
+    pub fn new_with_metrics(metrics: Arc<Metrics>) -> (Session, SessionIo) {
         let (ctrl, ctrl_rx) = mpsc::unbounded_channel();
         let (data, data_rx) = mpsc::channel(DATA_QUEUE_BLOCKS);
         (
             Session {
                 ctrl,
                 data,
+                metrics,
                 streams: Arc::new(Mutex::new(HashMap::new())),
             },
             SessionIo { ctrl_rx, data_rx },
@@ -108,18 +115,35 @@ impl Session {
             queued: AtomicUsize::new(0),
             pause_sent: AtomicBool::new(false),
         });
-        self.streams.lock().unwrap().insert(
-            conn_id,
-            StreamHandle {
-                tx,
-                flow: Arc::clone(&flow),
-            },
-        );
+        let active = {
+            let mut map = self.streams.lock().unwrap();
+            map.insert(
+                conn_id,
+                StreamHandle {
+                    tx,
+                    flow: Arc::clone(&flow),
+                },
+            );
+            map.len()
+        };
+        self.metrics
+            .active_streams
+            .store(active as u64, Ordering::Relaxed);
+        self.metrics
+            .conn_started_total
+            .fetch_add(1, Ordering::Relaxed);
         StreamReceiver { rx, flow }
     }
 
     pub fn unregister(&self, conn_id: u32) {
-        self.streams.lock().unwrap().remove(&conn_id);
+        let active = {
+            let mut map = self.streams.lock().unwrap();
+            map.remove(&conn_id);
+            map.len()
+        };
+        self.metrics
+            .active_streams
+            .store(active as u64, Ordering::Relaxed);
     }
 
     /// True once the tunnel writer has gone away (session is dead).
@@ -144,6 +168,7 @@ impl Session {
     fn abort_all(&self) {
         let handles: Vec<StreamHandle> =
             self.streams.lock().unwrap().drain().map(|(_, h)| h).collect();
+        self.metrics.active_streams.store(0, Ordering::Relaxed);
         for h in handles {
             let _ = h.tx.send(StreamEvent::Abort);
         }
@@ -210,6 +235,7 @@ where
         io.data_rx,
         keepalive.interval,
         real_bytes,
+        Arc::clone(&session.metrics),
     ));
 
     let reason = tokio::select! {
@@ -232,16 +258,35 @@ async fn run_writer<W: AsyncWrite + Unpin>(
     mut data_rx: mpsc::Receiver<Block>,
     ping_every: Option<Duration>,
     real_bytes: Option<Arc<AtomicU64>>,
+    metrics: Arc<Metrics>,
 ) -> std::io::Result<()> {
     let mut buf = BytesMut::with_capacity(MAX_BATCH_BYTES + 16);
     let idle = ping_every.unwrap_or(Duration::from_secs(365 * 24 * 3600));
+    let rtt_every = ping_every
+        .map(|d| d.min(Duration::from_secs(15)).max(Duration::from_millis(100)))
+        .unwrap_or(Duration::from_secs(365 * 24 * 3600));
+    let mut next_rtt_probe = if ping_every.is_some() {
+        Instant::now()
+    } else {
+        Instant::now() + Duration::from_secs(365 * 24 * 3600)
+    };
     let mut ctrl_open = true;
     let mut data_open = true;
 
-    let count = |b: &Block| {
-        if let Some(rb) = &real_bytes {
-            if b.is_data() {
-                rb.fetch_add(b.length() as u64, Ordering::Relaxed);
+    let count = |b: &Block, has_data: &mut bool| {
+        metrics.blocks_tx_total.fetch_add(1, Ordering::Relaxed);
+        if b.is_data() {
+            *has_data = true;
+            let len = b.length() as u64;
+            metrics.bytes_tx_total.fetch_add(len, Ordering::Relaxed);
+            if let Some(rb) = &real_bytes {
+                rb.fetch_add(len, Ordering::Relaxed);
+            }
+        } else if let BlockType::Control { code } = b.block_type() {
+            if code == CODE_NOISE || code == CODE_ECHO {
+                metrics
+                    .noise_bytes_tx_total
+                    .fetch_add(b.length() as u64, Ordering::Relaxed);
             }
         }
     };
@@ -261,11 +306,19 @@ async fn run_writer<W: AsyncWrite + Unpin>(
                 Some(b) => b,
                 None => { data_open = false; continue; }
             },
-            _ = tokio::time::sleep_until(deadline) => Block::new_control(0, CODE_PING),
+            _ = tokio::time::sleep_until(next_rtt_probe), if ping_every.is_some() => {
+                next_rtt_probe = Instant::now() + rtt_every;
+                metrics.make_ping_block()
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                next_rtt_probe = Instant::now() + rtt_every;
+                metrics.make_ping_block()
+            }
         };
 
         buf.clear();
-        count(&first);
+        let mut has_data = false;
+        count(&first, &mut has_data);
         encode_block(&first, &mut buf)?;
 
         // Coalesce any immediately waiting blocks up to 64 KB into a single write_all + flush
@@ -277,10 +330,13 @@ async fn run_writer<W: AsyncWrite + Unpin>(
                     Err(_) => break,
                 },
             };
-            count(&next);
+            count(&next, &mut has_data);
             encode_block(&next, &mut buf)?;
         }
 
+        if has_data {
+            metrics.write_batches_total.fetch_add(1, Ordering::Relaxed);
+        }
         w.write_all(&buf).await?;
         w.flush().await?;
     }
@@ -315,38 +371,59 @@ where
             Err(e) => return format!("tunnel read error: {}", e),
         };
 
+        session
+            .metrics
+            .blocks_rx_total
+            .fetch_add(1, Ordering::Relaxed);
         let conn_id = block.conn_id;
         match block.block_type() {
-            BlockType::Data { .. } => match session.get(conn_id) {
-                Some(h) => {
-                    let len = block.data.len();
-                    let queued = h.flow.queued.fetch_add(len, Ordering::SeqCst) + len;
-                    if queued > PAUSE_HIGH_WATERMARK
-                        && !h.flow.pause_sent.swap(true, Ordering::SeqCst)
-                    {
-                        debug!("conn {:08x}: {} bytes queued, sending PAUSE", conn_id, queued);
-                        let _ = session.ctrl.send(Block::new_control(conn_id, CODE_PAUSE));
+            BlockType::Data { .. } => {
+                session
+                    .metrics
+                    .bytes_rx_total
+                    .fetch_add(block.data.len() as u64, Ordering::Relaxed);
+                match session.get(conn_id) {
+                    Some(h) => {
+                        let len = block.data.len();
+                        let queued = h.flow.queued.fetch_add(len, Ordering::SeqCst) + len;
+                        if queued > PAUSE_HIGH_WATERMARK
+                            && !h.flow.pause_sent.swap(true, Ordering::SeqCst)
+                        {
+                            debug!("conn {:08x}: {} bytes queued, sending PAUSE", conn_id, queued);
+                            session
+                                .metrics
+                                .pause_events_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = session.ctrl.send(Block::new_control(conn_id, CODE_PAUSE));
+                        }
+                        if h.tx.send(StreamEvent::Data(block.data)).is_err() {
+                            session.unregister(conn_id);
+                        }
                     }
-                    if h.tx.send(StreamEvent::Data(block.data)).is_err() {
-                        session.unregister(conn_id);
+                    None => {
+                        if aborted_unknown.len() > 4096 {
+                            aborted_unknown.clear();
+                        }
+                        if aborted_unknown.insert(conn_id) {
+                            debug!("Data for unknown/closed conn {:08x}, sending ABORT", conn_id);
+                            let _ = session.data.try_send(Block::new_control(conn_id, CODE_ABORT));
+                        }
                     }
                 }
-                None => {
-                    if aborted_unknown.len() > 4096 {
-                        aborted_unknown.clear();
-                    }
-                    if aborted_unknown.insert(conn_id) {
-                        debug!("Data for unknown/closed conn {:08x}, sending ABORT", conn_id);
-                        let _ = session.data.try_send(Block::new_control(conn_id, CODE_ABORT));
-                    }
-                }
-            },
+            }
             BlockType::Control { code } => match code {
                 CODE_EOF => session.deliver(conn_id, StreamEvent::Eof),
                 CODE_PAUSE => session.deliver(conn_id, StreamEvent::Pause),
                 CODE_RESUME => session.deliver(conn_id, StreamEvent::Resume),
                 CODE_ABORT => {
-                    let removed = session.streams.lock().unwrap().remove(&conn_id);
+                    let (removed, active) = {
+                        let mut map = session.streams.lock().unwrap();
+                        (map.remove(&conn_id), map.len())
+                    };
+                    session
+                        .metrics
+                        .active_streams
+                        .store(active as u64, Ordering::Relaxed);
                     if let Some(h) = removed {
                         debug!("Peer closed/aborted conn {:08x}", conn_id);
                         let _ = h.tx.send(StreamEvent::Abort);
@@ -354,7 +431,15 @@ where
                 }
                 CODE_START => handler.on_start(conn_id, session),
                 CODE_ECHO => handler.on_echo(block, session),
-                CODE_NOISE | CODE_PING => {}
+                CODE_PING => {
+                    if !block.data.is_empty() {
+                        let _ = session
+                            .ctrl
+                            .send(Block::new_control_with_data(0, CODE_PONG, block.data));
+                    }
+                }
+                CODE_PONG => session.metrics.record_pong(&block.data),
+                CODE_NOISE => {}
                 other => debug!("Ignoring unknown control code {}", other),
             },
             BlockType::Unknown(tag) => warn!("Unknown block tag {:04x}", tag),
@@ -393,6 +478,12 @@ pub async fn run_stream(conn_id: u32, socket: TcpStream, rx: StreamReceiver, ses
         let _ = wr.shutdown().await;
     }
     session.unregister(conn_id);
+    session.metrics.record_stream_end(
+        end == StreamEnd::Graceful,
+        end == StreamEnd::LocalError,
+        end == StreamEnd::RemoteAbort,
+        end == StreamEnd::Timeout,
+    );
 
     if matches!(end, StreamEnd::LocalError | StreamEnd::Timeout) {
         let _ = session

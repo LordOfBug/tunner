@@ -13,6 +13,8 @@ pub const CODE_EOF: u16 = 4;
 pub const CODE_PAUSE: u16 = 5;
 /// Keepalive frame (conn_id 0); any received frame refreshes liveness.
 pub const CODE_PING: u16 = 6;
+/// Keepalive / RTT measurement reply echoing the 8-byte timestamp payload of `CODE_PING`.
+pub const CODE_PONG: u16 = 7;
 pub const CODE_ABORT: u16 = 0x00FF;
 
 pub const MAX_LENGTH: usize = 0xFFFF;

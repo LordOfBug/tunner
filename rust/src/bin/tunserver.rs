@@ -2,14 +2,17 @@ use clap::Parser;
 use log::{error, info, warn};
 use ssh_key::PublicKey;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tunner::{
     auth::{load_authorized_keys, server_authenticate, server_send_no_auth},
     configure_tunnel_socket,
+    metrics::{spawn_tsdb_reporter, Metrics, TsdbConfig},
     mux::{run_stream, run_tunnel, BlockHandler, Keepalive, Session},
     tls::build_server_acceptor,
     ws::ws_server_accept,
@@ -51,6 +54,15 @@ struct Args {
 
     #[arg(long = "keepalive", default_value_t = 20, help = "Keepalive ping interval in seconds (0 to disable)")]
     keepalive: u64,
+
+    #[arg(long = "tsdb-url", help = "Optional TSDB base or push URL (e.g. https://tsdb.zoomphant.com)")]
+    tsdb_url: Option<String>,
+
+    #[arg(long = "tsdb-token", help = "Optional TSDB bearer token (or set TUNNER_TSDB_TOKEN / ~/.tunner/tsdb.conf)")]
+    tsdb_token: Option<String>,
+
+    #[arg(long = "tsdb-interval", help = "TSDB push interval in seconds (default: 15)")]
+    tsdb_interval: Option<u64>,
 }
 
 struct ServerHandler {
@@ -66,17 +78,24 @@ impl BlockHandler for ServerHandler {
         let target = Arc::clone(&self.backend_target);
 
         tokio::spawn(async move {
+            let connect_t0 = Instant::now();
             let connect_res =
                 tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(target.as_str()))
                     .await;
+            let elapsed = connect_t0.elapsed();
 
             match connect_res {
                 Ok(Ok(backend_stream)) => {
+                    session.metrics.record_backend_connect(elapsed, true);
                     let _ = backend_stream.set_nodelay(true);
                     info!("Connected backend for {:08x} to {}", conn_id, target);
                     run_stream(conn_id, backend_stream, rx, session).await;
                 }
                 Ok(Err(e)) => {
+                    session.metrics.record_backend_connect(elapsed, false);
+                    session
+                        .metrics
+                        .log_event("warn", format!("backend connect failed to {}: {}", target, e));
                     warn!(
                         "Failed connecting backend for {:08x} to {}: {}",
                         conn_id, target, e
@@ -88,6 +107,10 @@ impl BlockHandler for ServerHandler {
                         .await;
                 }
                 Err(_) => {
+                    session.metrics.record_backend_connect(elapsed, false);
+                    session
+                        .metrics
+                        .log_event("warn", format!("backend connect timeout to {}", target));
                     warn!("Timed out connecting backend for {:08x} to {}", conn_id, target);
                     session.unregister(conn_id);
                     let _ = session
@@ -181,6 +204,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&listen_addr).await?;
     info!("Tunner server listening for tunnel clients on {}", listen_addr);
 
+    let metrics = Metrics::new();
+    let transport_mode: &'static str = match (use_tls, args.ws_path.is_some()) {
+        (true, true) => "ws-tls",
+        (true, false) => "tls",
+        (false, true) => "ws",
+        (false, false) => "tcp",
+    };
+    let (_tsdb_stop_tx, tsdb_stop_rx) = watch::channel(false);
+    if let Some(tsdb_cfg) = TsdbConfig::resolve(
+        args.tsdb_url.as_deref(),
+        args.tsdb_token.as_deref(),
+        args.tsdb_interval,
+    ) {
+        spawn_tsdb_reporter(
+            tsdb_cfg,
+            Arc::clone(&metrics),
+            "server",
+            transport_mode,
+            tsdb_stop_rx,
+        );
+    }
+
     let backend_target = Arc::new(format!("{}:{}", args.server, args.forward_port));
     let ws_path = args.ws_path.map(Arc::new);
     let keepalive = Keepalive::from_secs(args.keepalive);
@@ -201,6 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let acceptor = tls_acceptor.clone();
         let keys = auth_keys.clone();
         let ws = ws_path.clone();
+        let conn_metrics = Arc::clone(&metrics);
 
         tokio::spawn(async move {
             if let Some(acceptor) = acceptor {
@@ -217,9 +263,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                     {
                         Ok(ws_stream) => {
-                            serve_session(ws_stream, target, keepalive, peer_addr).await;
+                            serve_session(ws_stream, target, keepalive, peer_addr, conn_metrics)
+                                .await;
                         }
                         Err(e) => {
+                            conn_metrics
+                                .auth_failures_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            conn_metrics
+                                .log_event("warn", format!("ws auth failed from {}: {}", peer_addr, e));
                             warn!("WebSocket handshake failed from {}: {}", peer_addr, e);
                         }
                     }
@@ -233,6 +285,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                             Err(e) => {
+                                conn_metrics
+                                    .auth_failures_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                conn_metrics.log_event(
+                                    "warn",
+                                    format!("ssh auth failed from {}: {}", peer_addr, e),
+                                );
                                 warn!("SSH key auth failed from {}: {}", peer_addr, e);
                                 return;
                             }
@@ -242,21 +301,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
 
-                    serve_session(tls_stream, target, keepalive, peer_addr).await;
+                    serve_session(tls_stream, target, keepalive, peer_addr, conn_metrics).await;
                 }
             } else if let Some(ref path) = ws {
                 match ws_server_accept(tunnel_socket, path, keys.as_deref().map(|v| v.as_slice()))
                     .await
                 {
                     Ok(ws_stream) => {
-                        serve_session(ws_stream, target, keepalive, peer_addr).await;
+                        serve_session(ws_stream, target, keepalive, peer_addr, conn_metrics).await;
                     }
                     Err(e) => {
+                        conn_metrics
+                            .auth_failures_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        conn_metrics
+                            .log_event("warn", format!("ws auth failed from {}: {}", peer_addr, e));
                         warn!("WebSocket handshake failed from {}: {}", peer_addr, e);
                     }
                 }
             } else {
-                serve_session(tunnel_socket, target, keepalive, peer_addr).await;
+                serve_session(tunnel_socket, target, keepalive, peer_addr, conn_metrics).await;
             }
         });
     }
@@ -267,11 +331,14 @@ async fn serve_session<S>(
     backend_target: Arc<String>,
     keepalive: Keepalive,
     peer_addr: std::net::SocketAddr,
+    metrics: Arc<Metrics>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (session, io) = Session::new();
+    metrics.log_event("info", format!("session started from {}", peer_addr));
+    let (session, io) = Session::new_with_metrics(Arc::clone(&metrics));
     let handler = ServerHandler { backend_target };
     let reason = run_tunnel(stream, session, io, handler, keepalive, None).await;
+    metrics.log_event("info", format!("session ended ({}): {}", peer_addr, reason));
     info!("Tunnel session from {} ended: {}", peer_addr, reason);
 }

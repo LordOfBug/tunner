@@ -56,6 +56,9 @@ Compiled binaries:
 | `-a, --authorized-keys <PATH>` | *(none)* | OpenSSH `authorized_keys` file (auto-enables `--tls` and enforces SSH key auth) |
 | `--ws-path <PATH>` | *(none)* | Accept WebSocket upgrade on this HTTP path (e.g. `/ws`) |
 | `--keepalive <SECS>` | `20` | Keepalive ping interval in seconds (`0` to disable; timeout is `3 * keepalive`) |
+| `--tsdb-url <URL>` | *(none)* | Optional TSDB URL (e.g. `https://tsdb.zoomphant.com`) for metrics & logs |
+| `--tsdb-token <TOKEN>` | *(none)* | Bearer token for TSDB `/api/v1/push` |
+| `--tsdb-interval <SECS>` | `15` | Metrics push interval in seconds |
 
 ### `tunclient`
 | Flag | Default | Description |
@@ -76,6 +79,30 @@ Compiled binaries:
 | `--ws-path <PATH>` | *(none)* | Connect over WebSocket on this HTTP path (e.g. `/ws`) |
 | `--keepalive <SECS>` | `20` | Keepalive ping interval in seconds (`0` to disable) |
 | `--no-reconnect` | `false` | Exit instead of auto-reconnecting when the tunnel drops |
+| `--tsdb-url <URL>` | *(none)* | Optional TSDB URL (e.g. `https://tsdb.zoomphant.com`) for metrics & logs |
+| `--tsdb-token <TOKEN>` | *(none)* | Bearer token for TSDB `/api/v1/push` |
+| `--tsdb-interval <SECS>` | `15` | Metrics push interval in seconds |
+
+---
+
+## Optional TSDB Telemetry (`tsdb.zoomphant.com`)
+
+Both `tunclient` and `tunserver` can push performance telemetry (RTT latency via `PING`/`PONG`, backend connect latency, failure rate, stream end counts, throughput, batch sizes, pause events, reconnects, auth failures, and structured events) to `POST /api/v1/push`.
+
+### Configuration (in priority order)
+1. **CLI flags:** `--tsdb-url https://tsdb.zoomphant.com --tsdb-token <TOKEN> --tsdb-interval 15`
+2. **Environment variables:** `TUNNER_TSDB_URL`, `TUNNER_TSDB_TOKEN`, `TUNNER_TSDB_INTERVAL`
+3. **Home config file** (`~/.tunner/tsdb.conf` or `~/.tunner.conf`):
+   ```ini
+   url = https://tsdb.zoomphant.com
+   token = your-ingest-or-api-token
+   interval = 15
+   ```
+
+Streams are tagged with `app="tunner"`, `role="client"|"server"`, `host`, `mode` (`ws-tls` | `tls` | `ws` | `tcp`), and `version` so releases and transport modes can be compared in ZQL:
+```zql
+{app="tunner"} | metrics tunner_rtt_ms | avg(value) every 5m by (role, mode, host, version)
+```
 
 ---
 

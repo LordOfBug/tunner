@@ -5,12 +5,13 @@ use ssh_key::PrivateKey;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tunner::{
     auth::{client_authenticate, discover_default_keys, load_private_key},
     configure_tunnel_socket,
+    metrics::{spawn_tsdb_reporter, Metrics, TsdbConfig},
     mux::{run_stream, run_tunnel, BlockHandler, BoxedIo, Keepalive, Session, STREAM_READ_BUF},
     parse_rate,
     tls::{build_client_connector, make_server_name},
@@ -68,6 +69,15 @@ struct Args {
 
     #[arg(long = "no-reconnect", default_value_t = false, help = "Exit instead of auto-reconnecting when tunnel drops")]
     no_reconnect: bool,
+
+    #[arg(long = "tsdb-url", help = "Optional TSDB base or push URL (e.g. https://tsdb.zoomphant.com)")]
+    tsdb_url: Option<String>,
+
+    #[arg(long = "tsdb-token", help = "Optional TSDB bearer token (or set TUNNER_TSDB_TOKEN / ~/.tunner/tsdb.conf)")]
+    tsdb_token: Option<String>,
+
+    #[arg(long = "tsdb-interval", help = "TSDB push interval in seconds (default: 15)")]
+    tsdb_interval: Option<u64>,
 }
 
 static CONN_COUNTER: AtomicU32 = AtomicU32::new(1);
@@ -236,10 +246,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_rate, args.echo, args.keepalive
     );
 
+    let metrics = Metrics::new();
+    let transport_mode: &'static str = match (use_tls, args.ws_path.is_some()) {
+        (true, true) => "ws-tls",
+        (true, false) => "tls",
+        (false, true) => "ws",
+        (false, false) => "tcp",
+    };
+
     // 1. Establish initial tunnel connection before binding local port so auth/config errors fail fast
+    let hs_start = Instant::now();
     let initial_stream = establish_tunnel(&args, use_tls, &candidate_keys)
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+    metrics
+        .handshake_last_ms
+        .store(hs_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    metrics.log_event(
+        "info",
+        format!("connected to {}:{} ({})", args.server, args.remote_port, transport_mode),
+    );
 
     // 2. Bind local listener once; it stays alive across tunnel reconnections
     let local_addr = format!("{}:{}", args.interface, args.listen);
@@ -255,10 +281,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let active_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
     let (fatal_tx, mut fatal_rx) = watch::channel(false);
 
+    if let Some(tsdb_cfg) = TsdbConfig::resolve(
+        args.tsdb_url.as_deref(),
+        args.tsdb_token.as_deref(),
+        args.tsdb_interval,
+    ) {
+        spawn_tsdb_reporter(
+            tsdb_cfg,
+            Arc::clone(&metrics),
+            "client",
+            transport_mode,
+            fatal_rx.clone(),
+        );
+    }
+
     // 3. Spawn tunnel supervisor (manages current tunnel session + auto-reconnect)
     let sup_args = Arc::clone(&args);
     let sup_keys = Arc::clone(&candidate_keys);
     let sup_session = Arc::clone(&active_session);
+    let sup_metrics = Arc::clone(&metrics);
     let keepalive = Keepalive::from_secs(args.keepalive);
 
     tokio::spawn(async move {
@@ -271,29 +312,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     backoff_secs = 1;
                     s
                 }
-                None => match establish_tunnel(&sup_args, use_tls, &sup_keys).await {
-                    Ok(s) => {
-                        info!("Reconnected tunnel to {}:{}", sup_args.server, sup_args.remote_port);
-                        backoff_secs = 1;
-                        s
+                None => {
+                    let hs_t0 = Instant::now();
+                    match establish_tunnel(&sup_args, use_tls, &sup_keys).await {
+                        Ok(s) => {
+                            info!(
+                                "Reconnected tunnel to {}:{}",
+                                sup_args.server, sup_args.remote_port
+                            );
+                            sup_metrics
+                                .handshake_last_ms
+                                .store(hs_t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+                            sup_metrics
+                                .tunnel_reconnects_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            sup_metrics.log_event(
+                                "info",
+                                format!("reconnected to {}:{}", sup_args.server, sup_args.remote_port),
+                            );
+                            backoff_secs = 1;
+                            s
+                        }
+                        Err(e) => {
+                            let jitter_ms = rand::thread_rng().gen_range(0..500);
+                            warn!(
+                                "Reconnect failed ({}); retrying in ~{}s...",
+                                e, backoff_secs
+                            );
+                            sup_metrics.log_event("warn", format!("reconnect failed: {}", e));
+                            tokio::time::sleep(
+                                Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms),
+                            )
+                            .await;
+                            backoff_secs = (backoff_secs * 2).min(30);
+                            continue;
+                        }
                     }
-                    Err(e) => {
-                        let jitter_ms = rand::thread_rng().gen_range(0..500);
-                        warn!(
-                            "Reconnect failed ({}); retrying in ~{}s...",
-                            e, backoff_secs
-                        );
-                        tokio::time::sleep(
-                            Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms),
-                        )
-                        .await;
-                        backoff_secs = (backoff_secs * 2).min(30);
-                        continue;
-                    }
-                },
+                }
             };
 
-            let (session, io) = Session::new();
+            let (session, io) = Session::new_with_metrics(Arc::clone(&sup_metrics));
             *sup_session.lock().unwrap() = Some(session.clone());
 
             let (noise_stop_tx, noise_stop_rx) = watch::channel(false);
@@ -321,6 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let _ = noise_stop_tx.send(true);
             *sup_session.lock().unwrap() = None;
+            sup_metrics.log_event("warn", format!("tunnel disconnected: {}", reason));
 
             if sup_args.no_reconnect {
                 error!("Tunnel disconnected ({}); shutting down.", reason);

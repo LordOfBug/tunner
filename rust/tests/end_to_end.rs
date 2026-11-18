@@ -696,3 +696,238 @@ async fn test_client_auto_reconnect() -> Result<(), Box<dyn std::error::Error>> 
     assert!(reconnected, "tunclient did not auto-reconnect after server restart");
     Ok(())
 }
+
+#[tokio::test]
+async fn test_tsdb_metrics_push_and_rtt() -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    let server_bin = env!("CARGO_BIN_EXE_tunserver");
+    let client_bin = env!("CARGO_BIN_EXE_tunclient");
+
+    let tsdb_port = 18800u16;
+    let tunnel_port = 18801u16;
+    let echo_port = 18802u16;
+    let client_port = 18803u16;
+
+    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let rejected_first: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let tsdb_listener = TcpListener::bind(format!("127.0.0.1:{}", tsdb_port)).await?;
+    let recv_clone = Arc::clone(&received);
+    let rej_clone = Arc::clone(&rejected_first);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = tsdb_listener.accept().await else {
+                break;
+            };
+            let recv_inner = Arc::clone(&recv_clone);
+            let rej_inner = Arc::clone(&rej_clone);
+            tokio::spawn(async move {
+                let mut raw = Vec::with_capacity(4096);
+                let mut buf = [0u8; 1024];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let hend = pos + 4;
+                            header_end = Some(hend);
+                            let hdr_str = String::from_utf8_lossy(&raw[..hend]);
+                            for line in hdr_str.lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(hend) = header_end {
+                        if raw.len() >= hend + content_len {
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(hend) = header_end {
+                    let hdr_str = String::from_utf8_lossy(&raw[..hend]);
+                    let req_ok = hdr_str.starts_with("POST /api/v1/push ");
+                    let auth_ok = hdr_str.lines().any(|line| {
+                        line.split_once(':')
+                            .map(|(k, v)| {
+                                k.trim().eq_ignore_ascii_case("authorization")
+                                    && v.trim() == "Bearer test-secret"
+                            })
+                            .unwrap_or(false)
+                    });
+                    let end = (hend + content_len).min(raw.len());
+                    let body = String::from_utf8_lossy(&raw[hend..end]).to_string();
+                    let mut rej_guard = rej_inner.lock().await;
+                    if rej_guard.is_none() && req_ok && auth_ok {
+                        *rej_guard = Some(body);
+                        drop(rej_guard);
+                        let reply = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = sock.write_all(reply.as_bytes()).await;
+                        let _ = sock.shutdown().await;
+                    } else {
+                        drop(rej_guard);
+                        if req_ok && auth_ok {
+                            recv_inner.lock().await.push(body);
+                        }
+                        let reply_body = b"{\"status\":\"success\"}";
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            reply_body.len()
+                        );
+                        let _ = sock.write_all(reply.as_bytes()).await;
+                        let _ = sock.write_all(reply_body).await;
+                        let _ = sock.shutdown().await;
+                    }
+                }
+            });
+        }
+    });
+
+    let tsdb_url = format!("http://127.0.0.1:{}", tsdb_port);
+    let _server_proc = ProcessGuard(
+        Command::new(server_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &tunnel_port.to_string(),
+                "-f",
+                &echo_port.to_string(),
+                "-m",
+                "test",
+                "--tsdb-url",
+                &tsdb_url,
+                "--tsdb-token",
+                "test-secret",
+                "--tsdb-interval",
+                "1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let _probe = wait_for_port(tunnel_port, 30).await?;
+    drop(_probe);
+
+    let _client_proc = ProcessGuard(
+        Command::new(client_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &client_port.to_string(),
+                "-r",
+                &tunnel_port.to_string(),
+                "--tsdb-url",
+                &tsdb_url,
+                "--tsdb-token",
+                "test-secret",
+                "--tsdb-interval",
+                "1",
+                "127.0.0.1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let mut stream = wait_for_port(client_port, 30).await?;
+    let payload = b"tsdb-telemetry-check\n";
+    stream.write_all(payload).await?;
+    stream.shutdown().await?;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await?;
+    assert_eq!(resp, payload);
+
+    // Wait for both client and server TSDB intervals (~1s) to push
+    let mut has_client = false;
+    let mut has_server = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let snapshot = received.lock().await.clone();
+        has_client = snapshot.iter().any(|b| b.contains("\"role\":\"client\""));
+        has_server = snapshot.iter().any(|b| b.contains("\"role\":\"server\""));
+        if has_client && has_server {
+            // Wait one more tick so post-traffic counters are included
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            break;
+        }
+    }
+    assert!(has_client, "Expected TSDB push from tunclient");
+    assert!(has_server, "Expected TSDB push from tunserver");
+
+    let payloads = received.lock().await;
+    let client_body = payloads
+        .iter()
+        .rev()
+        .find(|b| b.contains("\"role\":\"client\""))
+        .unwrap();
+    let server_body = payloads
+        .iter()
+        .rev()
+        .find(|b| b.contains("\"role\":\"server\""))
+        .unwrap();
+
+    fn extract_metric(body: &str, name: &str) -> f64 {
+        let needle = format!("\"name\":\"{}\"", name);
+        let idx = body.find(&needle).unwrap();
+        let after = &body[idx..];
+        let pts = after.find("\"points\":[[").unwrap();
+        let comma = after[pts..].find(',').unwrap() + pts + 1;
+        let close = after[comma..].find("]]").unwrap() + comma;
+        after[comma..close].parse::<f64>().unwrap()
+    }
+
+    for key in [
+        "\"tunner_rtt_ms\"",
+        "\"tunner_bytes_tx_total\"",
+        "\"tunner_connections_started_total\"",
+        "\"tunner_backend_connect_ms\"",
+    ] {
+        assert!(client_body.contains(key), "client payload missing {}", key);
+        assert!(server_body.contains(key), "server payload missing {}", key);
+    }
+    let first_rejected = rejected_first
+        .lock()
+        .await
+        .clone()
+        .expect("Expected first push to be injected with 503");
+    let retried_pos = payloads
+        .iter()
+        .position(|b| b == &first_rejected)
+        .expect("Expected 503-rejected snapshot to be retained and redelivered on retry");
+    let role_tag = if first_rejected.contains("\"role\":\"client\"") {
+        "\"role\":\"client\""
+    } else {
+        "\"role\":\"server\""
+    };
+    let later_same_role = payloads
+        .iter()
+        .skip(retried_pos + 1)
+        .any(|b| b.contains(role_tag));
+    assert!(
+        later_same_role,
+        "Expected retried snapshot to be delivered oldest-first before subsequent snapshots"
+    );
+
+    assert!(extract_metric(client_body, "tunner_bytes_tx_total") >= payload.len() as f64);
+    assert!(extract_metric(client_body, "tunner_connections_started_total") >= 1.0);
+    assert!(extract_metric(server_body, "tunner_bytes_tx_total") >= payload.len() as f64);
+    assert!(extract_metric(server_body, "tunner_connections_started_total") >= 1.0);
+    assert!(extract_metric(client_body, "tunner_rtt_ms") > 0.0);
+
+    Ok(())
+}
