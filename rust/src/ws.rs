@@ -16,6 +16,7 @@ use log::{debug, info, warn};
 use rand::RngCore;
 use ring::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
 use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -211,17 +212,17 @@ where
     Ok(spawn_ws_pump(stream, true))
 }
 
-/// Server-side WebSocket upgrade + path & SSH-key header verification.
-/// On invalid path or unauthorized key, responds with an ordinary `HTTP/1.1 404 Not Found`.
+/// Server-side WebSocket upgrade + multi-route path & SSH-key header verification.
+/// On non-matching path or unauthorized key, responds with `HTTP/1.1 404 Not Found`.
+/// Returns `(ws_stream, matched_backend_target)`.
 pub async fn ws_server_accept<S>(
     mut stream: S,
-    expected_path: &str,
+    routes: &HashMap<String, String>,
     authorized_keys: Option<&[PublicKey]>,
-) -> Result<DuplexStream, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<(DuplexStream, String), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let ws_path = normalize_ws_path(expected_path);
     let raw_req = tokio::time::timeout(Duration::from_secs(10), read_http_headers(&mut stream))
         .await
         .map_err(|_| "Timed out reading HTTP upgrade request")??;
@@ -254,27 +255,35 @@ where
         }
     }
 
-    if !method.eq_ignore_ascii_case("GET") || clean_path != ws_path || !is_upgrade || sec_key.is_none()
-    {
+    let matched_target = if method.eq_ignore_ascii_case("GET") && is_upgrade && sec_key.is_some() {
+        routes.get(clean_path).cloned()
+    } else {
+        None
+    };
+
+    let Some(target) = matched_target else {
         let _ = send_404(&mut stream).await;
         return Err(format!(
             "Rejected non-matching WebSocket request ({} {})",
             method, clean_path
         )
         .into());
-    }
+    };
 
     if let Some(allowed) = authorized_keys {
         let mut matched_fp = None;
         for hdr in &auth_headers {
-            if let Some(fp) = verify_auth_header_value(hdr, &ws_path, allowed) {
+            if let Some(fp) = verify_auth_header_value(hdr, clean_path, allowed) {
                 matched_fp = Some(fp);
                 break;
             }
         }
         match matched_fp {
             Some(fp) => {
-                info!("Authenticated WebSocket client with SSH key {}", fp);
+                info!(
+                    "Authenticated WebSocket client on {} (-> {}) with SSH key {}",
+                    clean_path, target, fp
+                );
             }
             None => {
                 let _ = send_404(&mut stream).await;
@@ -294,7 +303,7 @@ where
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
 
-    Ok(spawn_ws_pump(stream, false))
+    Ok((spawn_ws_pump(stream, false), target))
 }
 
 async fn send_404<S: AsyncWrite + Unpin>(stream: &mut S) -> std::io::Result<()> {

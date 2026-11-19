@@ -290,11 +290,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.tsdb_token.as_deref(),
         args.tsdb_interval,
     ) {
+        let route_label = match args.ws_path.as_deref() {
+            Some(p) => format!("{}{}", args.server, tunner::ws::normalize_ws_path(p)),
+            None => format!("{}:{}", args.server, args.remote_port),
+        };
         spawn_tsdb_reporter(
             tsdb_cfg,
             Arc::clone(&metrics),
             "client",
             transport_mode,
+            Some(route_label),
             fatal_rx.clone(),
         );
     }

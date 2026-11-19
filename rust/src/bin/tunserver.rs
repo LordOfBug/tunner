@@ -1,6 +1,7 @@
 use clap::Parser;
 use log::{error, info, warn};
 use ssh_key::PublicKey;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use tunner::{
     metrics::{spawn_tsdb_reporter, Metrics, MonitoredTcpStream, TsdbConfig},
     mux::{run_stream, run_tunnel, BlockHandler, Keepalive, Session},
     tls::build_server_acceptor,
-    ws::ws_server_accept,
+    ws::{normalize_ws_path, ws_server_accept},
     Block, CODE_ABORT, CODE_ECHO,
 };
 
@@ -49,8 +50,8 @@ struct Args {
     #[arg(short = 'a', long = "authorized-keys", help = "Path to OpenSSH authorized_keys file for client authentication")]
     authorized_keys: Option<String>,
 
-    #[arg(long = "ws-path", help = "Accept WebSocket upgrade on this HTTP path (e.g. /ws) for CDN/Cloudflare compatibility")]
-    ws_path: Option<String>,
+    #[arg(long = "ws-route", help = "WebSocket route mapping: <PATH>[=<HOST:PORT|PORT>] (repeatable, e.g. /kr=6666 --ws-route /ip=127.0.0.1:1080)")]
+    ws_route: Vec<String>,
 
     #[arg(long = "keepalive", default_value_t = 20, help = "Keepalive ping interval in seconds (0 to disable)")]
     keepalive: u64,
@@ -67,6 +68,38 @@ struct Args {
 
 struct ServerHandler {
     backend_target: Arc<String>,
+}
+
+fn parse_ws_routes(
+    raw: &[String],
+    default_host: &str,
+    default_port: u16,
+) -> Result<Option<Arc<HashMap<String, String>>>, Box<dyn std::error::Error>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut map = HashMap::new();
+    for entry in raw {
+        let (path_part, target) = match entry.split_once('=') {
+            Some((p, t)) => {
+                let t = t.trim();
+                if t.is_empty() {
+                    return Err(format!("Empty target in --ws-route '{}'", entry).into());
+                }
+                let addr = if t.parse::<u16>().is_ok() {
+                    format!("{}:{}", default_host, t)
+                } else {
+                    t.to_string()
+                };
+                (p, addr)
+            }
+            None => (entry.as_str(), format!("{}:{}", default_host, default_port)),
+        };
+        let norm_path = normalize_ws_path(path_part);
+        info!("WebSocket route enabled: {} -> {}", norm_path, target);
+        map.insert(norm_path, target);
+    }
+    Ok(Some(Arc::new(map)))
 }
 
 impl BlockHandler for ServerHandler {
@@ -170,9 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    if let Some(ref ws_path) = args.ws_path {
-        info!("WebSocket transport enabled on path: {}", ws_path);
-    }
+    let ws_routes = parse_ws_routes(&args.ws_route, &args.server, args.forward_port)?;
 
     // If test mode is enabled, run an in-process TCP Echo Server on the forward port
     if args.mode.eq_ignore_ascii_case("test") {
@@ -205,7 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Tunner server listening for tunnel clients on {}", listen_addr);
 
     let metrics = Metrics::new();
-    let transport_mode: &'static str = match (use_tls, args.ws_path.is_some()) {
+    let transport_mode: &'static str = match (use_tls, ws_routes.is_some()) {
         (true, true) => "ws-tls",
         (true, false) => "tls",
         (false, true) => "ws",
@@ -222,12 +253,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&metrics),
             "server",
             transport_mode,
+            None,
             tsdb_stop_rx,
         );
     }
 
     let backend_target = Arc::new(format!("{}:{}", args.server, args.forward_port));
-    let ws_path = args.ws_path.map(Arc::new);
     let keepalive = Keepalive::from_secs(args.keepalive);
 
     loop {
@@ -245,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let target = Arc::clone(&backend_target);
         let acceptor = tls_acceptor.clone();
         let keys = auth_keys.clone();
-        let ws = ws_path.clone();
+        let routes = ws_routes.clone();
         let conn_metrics = Arc::clone(&metrics);
 
         tokio::spawn(async move {
@@ -259,13 +290,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                if let Some(ref path) = ws {
-                    match ws_server_accept(tls_stream, path, keys.as_deref().map(|v| v.as_slice()))
-                        .await
+                if let Some(ref routes_map) = routes {
+                    match ws_server_accept(
+                        tls_stream,
+                        routes_map,
+                        keys.as_deref().map(|v| v.as_slice()),
+                    )
+                    .await
                     {
-                        Ok(ws_stream) => {
-                            serve_session(ws_stream, target, keepalive, peer_addr, conn_metrics)
-                                .await;
+                        Ok((ws_stream, route_target)) => {
+                            serve_session(
+                                ws_stream,
+                                Arc::new(route_target),
+                                keepalive,
+                                peer_addr,
+                                conn_metrics,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             conn_metrics
@@ -304,12 +345,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     serve_session(tls_stream, target, keepalive, peer_addr, conn_metrics).await;
                 }
-            } else if let Some(ref path) = ws {
-                match ws_server_accept(tunnel_socket, path, keys.as_deref().map(|v| v.as_slice()))
-                    .await
+            } else if let Some(ref routes_map) = routes {
+                match ws_server_accept(
+                    tunnel_socket,
+                    routes_map,
+                    keys.as_deref().map(|v| v.as_slice()),
+                )
+                .await
                 {
-                    Ok(ws_stream) => {
-                        serve_session(ws_stream, target, keepalive, peer_addr, conn_metrics).await;
+                    Ok((ws_stream, route_target)) => {
+                        serve_session(
+                            ws_stream,
+                            Arc::new(route_target),
+                            keepalive,
+                            peer_addr,
+                            conn_metrics,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         conn_metrics

@@ -429,6 +429,7 @@ fn build_push_payload(
     role: &str,
     host: &str,
     mode: &str,
+    route: Option<&str>,
     ts_ms: u64,
 ) -> String {
     let rtt_last = metrics.rtt_last_us.load(Ordering::Relaxed);
@@ -538,6 +539,10 @@ fn build_push_payload(
     push_json_escaped(&mut json, mode);
     json.push_str(",\"version\":");
     push_json_escaped(&mut json, env!("CARGO_PKG_VERSION"));
+    if let Some(r) = route {
+        json.push_str(",\"route\":");
+        push_json_escaped(&mut json, r);
+    }
     json.push_str("},\"metrics\":[");
 
     let gauges: &[(&str, f64)] = &[
@@ -762,6 +767,7 @@ pub fn spawn_tsdb_reporter(
     metrics: Arc<Metrics>,
     role: &'static str,
     mode: &'static str,
+    route: Option<String>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let endpoint = match parse_endpoint(&config.url) {
@@ -805,7 +811,7 @@ pub fn spawn_tsdb_reporter(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let body = build_push_payload(&metrics, &mut prev, role, &host, mode, unix_ms());
+                    let body = build_push_payload(&metrics, &mut prev, role, &host, mode, route.as_deref(), unix_ms());
                     enqueue_snapshot(&mut pending, body);
                     flush_pending(&mut pending, &endpoint, tls.as_ref(), &config.token).await;
                 }
@@ -813,7 +819,7 @@ pub fn spawn_tsdb_reporter(
                     match res {
                         Ok(()) if !*shutdown.borrow() => continue,
                         Ok(()) | Err(_) => {
-                            let body = build_push_payload(&metrics, &mut prev, role, &host, mode, unix_ms());
+                            let body = build_push_payload(&metrics, &mut prev, role, &host, mode, route.as_deref(), unix_ms());
                             enqueue_snapshot(&mut pending, body);
                             flush_pending(&mut pending, &endpoint, tls.as_ref(), &config.token).await;
                             break;
@@ -867,7 +873,7 @@ mod tests {
 
         m.log_event("warn", "quote \" and \\ newline\nhere".to_string());
         let mut prev = PrevSnapshot::default();
-        let body = build_push_payload(&m, &mut prev, "client", "mac", "ws-tls", 1760000000000);
+        let body = build_push_payload(&m, &mut prev, "client", "mac", "ws-tls", Some("proxy.kr/kr"), 1760000000000);
         assert!(body.contains("\"tunner_rtt_ms\""));
         assert!(body.contains("quote \\\" and \\\\ newline\\nhere"));
     }

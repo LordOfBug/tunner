@@ -19,8 +19,8 @@ Tunner supports three transport modes depending on the flags you pass:
   * If `--tls-ca`, `--tls-fingerprint`, and `--tls-insecure` are all omitted, `tunclient` automatically verifies against the **OS system root CA store** (for Let's Encrypt or Cloudflare certificates).
   * If `-k` is omitted, `tunclient` automatically discovers private keys in `~/.ssh/` (`id_ed25519`, `id_ecdsa`, `id_rsa`, `id_dsa`).
 
-### 3. WebSocket over TLS Mode (`--ws-path <PATH>`) — Cloudflare / CDN Compatible
-* Passing `--ws-path /your-secret-path` wraps the tunnel in RFC 6455 binary WebSocket frames and moves SSH key authentication into the `X-Tunner-Auth` HTTP Upgrade header (zero extra round trips).
+### 3. WebSocket over TLS Mode (`--ws-route` on server / `--ws-path` on client) — Cloudflare / Multi-Route Compatible
+* Passing `--ws-route <PATH>[=<HOST:PORT|PORT>]` on `tunserver` (repeatable) wraps the tunnel in RFC 6455 binary WebSocket frames, routes each path to its backend, and moves SSH key authentication into the `X-Tunner-Auth` HTTP Upgrade header (zero extra round trips).
 * Any HTTP request to a wrong path or without a valid SSH signature receives a normal `HTTP/1.1 404 Not Found` response, defeating active probing.
 * Works directly with **Cloudflare Proxy (orange cloud)** on port `443`.
 
@@ -54,7 +54,7 @@ Compiled binaries:
 | `--tls-cert <PATH>` | *(auto)* | PEM certificate file (auto-generates self-signed if omitted) |
 | `--tls-key <PATH>` | *(auto)* | PEM private key file |
 | `-a, --authorized-keys <PATH>` | *(none)* | OpenSSH `authorized_keys` file (auto-enables `--tls` and enforces SSH key auth) |
-| `--ws-path <PATH>` | *(none)* | Accept WebSocket upgrade on this HTTP path (e.g. `/ws`) |
+| `--ws-route <SPEC>` | *(none)* | WebSocket route `<PATH>[=<HOST:PORT|PORT>]` (repeatable, e.g. `/kr=6666 --ws-route /ip=127.0.0.1:1080`) |
 | `--keepalive <SECS>` | `20` | Keepalive ping interval in seconds (`0` to disable; timeout is `3 * keepalive`) |
 | `--tsdb-url <URL>` | *(none)* | Optional TSDB URL (e.g. `https://tsdb.zoomphant.com`) for metrics & logs |
 | `--tsdb-token <TOKEN>` | *(none)* | Bearer token for TSDB `/api/v1/push` |
@@ -114,9 +114,9 @@ Streams are tagged with `app="tunner"`, `role="client"|"server"`, `host`, `mode`
 ```bash
 sudo /usr/local/bin/tunserver \
   --tls --tls-cert /etc/ssl/cf-origin.pem --tls-key /etc/ssl/cf-origin.key \
-  --ws-path /secret-tunnel \
+  --ws-route /secret-tunnel=127.0.0.1:6666 \
   -a /home/ubuntu/.ssh/authorized_keys \
-  -l 443 -f 6666
+  -l 443
 ```
 
 **2. On your Mac** (system root CAs verify Cloudflare's edge cert automatically):

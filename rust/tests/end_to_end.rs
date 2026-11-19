@@ -407,6 +407,21 @@ async fn test_websocket_tls_auth_and_404_probe_defense() -> Result<(), Box<dyn s
     let tunnel_port = 18500;
     let echo_port = 18501;
     let client_port = 18502;
+    let second_backend_port = 18504;
+    let second_client_port = 18505;
+
+    // Second backend on 18504 that returns a fixed banner so we can verify multi-route forwarding
+    let second_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", second_backend_port)).await?;
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut sock, _)) = second_listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = sock.write_all(b"FROM_ROUTE_B\n").await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        }
+    });
 
     let _server_proc = ProcessGuard(
         Command::new(server_bin)
@@ -420,8 +435,10 @@ async fn test_websocket_tls_auth_and_404_probe_defense() -> Result<(), Box<dyn s
                 "-m",
                 "test",
                 "--tls",
-                "--ws-path",
+                "--ws-route",
                 "/secret-tunnel",
+                "--ws-route",
+                &format!("/route-b=127.0.0.1:{}", second_backend_port),
                 "--authorized-keys",
                 auth_keys_path.to_str().unwrap(),
             ])
@@ -511,6 +528,32 @@ async fn test_websocket_tls_auth_and_404_probe_defense() -> Result<(), Box<dyn s
     rd.read_to_end(&mut resp).await?;
     writer.await?;
     assert_eq!(resp, expected);
+
+    // 4. Second client on /route-b reaches the second backend (18504) on the same server port
+    let _client_b = ProcessGuard(
+        Command::new(client_bin)
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-l",
+                &second_client_port.to_string(),
+                "-r",
+                &tunnel_port.to_string(),
+                "--ws-path",
+                "/route-b",
+                "-k",
+                key_path.to_str().unwrap(),
+                "--tls-insecure",
+                "127.0.0.1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let mut stream_b = wait_for_port(second_client_port, 30).await?;
+    let mut resp_b = Vec::new();
+    stream_b.read_to_end(&mut resp_b).await?;
+    assert_eq!(resp_b, b"FROM_ROUTE_B\n");
 
     let _ = std::fs::remove_file(auth_keys_path);
     let _ = std::fs::remove_file(key_path);
